@@ -1,1823 +1,1410 @@
 """
-CRYSYS v3.0 - Enhanced Streamlit Frontend
-All Visual Improvements Implemented:
-- Color-coded gradient cards
-- Interactive timeline with hover
-- Enhanced error cards with previews
-- Visual health meters
-- Sticky summary bar
-- Dark/Light mode toggle
-- Better charts and filtering
-- Smooth animations
+🔥 CRYSYS v3.0 - ULTIMATE EDITION 🔥
+Updated with:
+- Line number tracking for each suspicious log
+- Context extraction (5 lines before/after)
+- Timestamp extraction
+- Error chain detection support
 """
 
-import streamlit as st
-import sys
-import os
-from pathlib import Path
+import time
 import json
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
-from io import BytesIO
-from collections import defaultdict
+import pickle
 import re
+import hashlib
+from typing import TypedDict, List, Optional, Dict
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
+from enum import Enum
+from pydantic import BaseModel, Field
+from datetime import datetime
+from rich import print as rprint
+from rich.panel import Panel
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.table import Table
+from rich.live import Live
+from rich.text import Text
 
-# streamlit run streamlit_app_enhanced.py
+console = Console()
 
-
-# Add backend to path
-sys.path.append(str(Path(__file__).parent / 'backend'))
-from crysys_v3 import UltimateCRYSYS
-from error_grouper import ErrorGrouper
-from timeline_analyzer import TimelineAnalyzer
-from export_utils import ExportUtils
 
 # ============================================================================
-# PAGE CONFIG
+# DATA MODELS
 # ============================================================================
 
-st.set_page_config(
-    page_title="CRYSYS v3.0 - Log Analysis",
-    page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+class SeverityLevel(str, Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+
+class ErrorCategory(str, Enum):
+    DATABASE = "DATABASE"
+    NULL_POINTER = "NULL_POINTER"
+    NETWORK = "NETWORK"
+    AUTHENTICATION = "AUTHENTICATION"
+    GENERIC = "GENERIC"
+
+
+class ConfidenceAwareEvent(BaseModel):
+    """Event with confidence tracking"""
+    error_type: str
+    category: ErrorCategory
+    severity: SeverityLevel
+    confidence: float = Field(ge=0.0, le=1.0)
+    exception_class: str
+    affected_component: str
+    error_message: str
+    needs_review: bool = False
+    reasoning: str
+
+
+class AnalysisState(TypedDict):
+    """State with all improvements"""
+    # Input
+    logs: list[str]
+    total_logs: int
+
+    # Memory cache
+    cache_hits: int
+    cache_misses: int
+
+    # Screening - NOW WITH LINE NUMBERS
+    suspicious_indices: list[int]          # Original line numbers in file
+    suspicious_with_context: list[dict]    # NEW: Each suspicious log with context
+    screening_confidence: float
+
+    # Categorization
+    db_errors: list[int]
+    null_errors: list[int]
+    network_errors: list[int]
+    auth_errors: list[int]
+    generic_errors: list[int]
+
+    # Analysis results
+    error_events: list[dict]
+    high_confidence_events: list[dict]
+    low_confidence_events: list[dict]
+
+    # Final
+    final_summary: str
+    recommendations: list[str]
+    highest_severity: str
+    requires_immediate_attention: bool
+
+    # Metrics
+    tokens_used: int
+    processing_time: float
+    route_taken: str
+
+    # Control
+    current_stage: str
+
 
 # ============================================================================
-# SESSION STATE
+# MEMORY SYSTEM
 # ============================================================================
 
-if 'results' not in st.session_state:
-    st.session_state.results = None
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
-if 'alert_rules' not in st.session_state:
-    st.session_state.alert_rules = []
-if 'triggered_alerts' not in st.session_state:
-    st.session_state.triggered_alerts = []
-if 'grouped_errors' not in st.session_state:
-    st.session_state.grouped_errors = None
-if 'timeline_data' not in st.session_state:
-    st.session_state.timeline_data = None
-if 'theme_mode' not in st.session_state:
-    st.session_state.theme_mode = 'dark'
-if 'view_mode_compact' not in st.session_state:
-    st.session_state.view_mode_compact = False
+class PatternMemory:
+    """Cache system to remember known patterns"""
+
+    def __init__(self, cache_file: str = "crysys_cache.pkl"):
+        self.cache_file = Path(cache_file)
+        self.cache = self._load_cache()
+
+    def _load_cache(self) -> dict:
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    cache = pickle.load(f)
+                if not isinstance(cache, dict):
+                    return self._create_empty_cache()
+                if 'critical_patterns' not in cache or 'safe_patterns' not in cache:
+                    return self._create_empty_cache()
+                console.print(f"[green]✓ Loaded {len(cache.get('critical_patterns', set()))} cached patterns[/green]")
+                return cache
+            except Exception as e:
+                console.print(f"[yellow]⚠ Cache load error: {e}[/yellow]")
+                return self._create_empty_cache()
+        return self._create_empty_cache()
+
+    def _create_empty_cache(self) -> dict:
+        return {
+            'critical_patterns': set(),
+            'safe_patterns': set(),
+            'error_classifications': {}
+        }
+
+    def save_cache(self):
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.cache, f)
+        except Exception as e:
+            console.print(f"[yellow]⚠ Cache save failed: {e}[/yellow]")
+
+    def get_signature(self, log: str) -> str:
+        sig = re.sub(r'\d{4}-\d{2}-\d{2}', 'DATE', log)
+        sig = re.sub(r'\d{2}:\d{2}:\d{2}', 'TIME', sig)
+        sig = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', 'IP', sig)
+        sig = re.sub(r'[0-9]+', 'NUM', sig)
+        sig = re.sub(r'user_[a-zA-Z0-9]+', 'USER_ID', sig)
+        return sig[:300]
+
+    def is_known_critical(self, log: str) -> bool:
+        return self.get_signature(log) in self.cache['critical_patterns']
+
+    def is_known_safe(self, log: str) -> bool:
+        return self.get_signature(log) in self.cache['safe_patterns']
+
+    def mark_critical(self, log: str, classification: dict = None):
+        sig = self.get_signature(log)
+        self.cache['critical_patterns'].add(sig)
+        if classification:
+            self.cache['error_classifications'][sig] = classification
+
+    def mark_safe(self, log: str):
+        self.cache['safe_patterns'].add(sig := self.get_signature(log))
+
+    def get_classification(self, log: str) -> Optional[dict]:
+        return self.cache['error_classifications'].get(self.get_signature(log))
+
+    def clear_cache(self):
+        try:
+            if self.cache_file.exists():
+                self.cache_file.unlink()
+                self.cache = self._create_empty_cache()
+        except Exception as e:
+            console.print(f"[red]Failed to clear cache: {e}[/red]")
+
 
 # ============================================================================
-# ENHANCED CUSTOM CSS
+# NEW: CONTEXT EXTRACTOR
 # ============================================================================
 
-st.markdown("""
-<style>
-    /* Main Header with Animation */
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        padding: 1rem 0;
-        animation: fadeIn 0.8s ease-in;
-    }
-    
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(-20px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-    
-    /* Sticky Summary Bar */
-    .sticky-summary {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: linear-gradient(135deg, #1a2332 0%, #0f1419 100%);
-        padding: 12px 20px;
-        border-bottom: 2px solid #667eea;
-        backdrop-filter: blur(10px);
-        display: flex;
-        justify-content: space-around;
-        align-items: center;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-        margin-bottom: 20px;
-    }
-    
-    .sticky-item {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-size: 0.9rem;
-    }
-    
-    .sticky-critical { color: #f56565; font-weight: bold; }
-    .sticky-high { color: #ed8936; font-weight: bold; }
-    .sticky-info { color: #a0aec0; }
-    
-    /* Enhanced Metric Cards with Gradients */
-    .metric-card-critical {
-        background: linear-gradient(135deg, #f56565 0%, #c53030 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 8px 16px rgba(245, 101, 101, 0.3);
-        transition: transform 0.3s, box-shadow 0.3s;
-        animation: pulse 2s infinite;
-    }
-    
-    @keyframes pulse {
-        0%, 100% { box-shadow: 0 8px 16px rgba(245, 101, 101, 0.3); }
-        50% { box-shadow: 0 8px 24px rgba(245, 101, 101, 0.6); }
-    }
-    
-    .metric-card-critical:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 12px 24px rgba(245, 101, 101, 0.5);
-    }
-    
-    .metric-card-warning {
-        background: linear-gradient(135deg, #ed8936 0%, #c05621 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(237, 137, 54, 0.3);
-        transition: transform 0.3s;
-    }
-    
-    .metric-card-warning:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 8px 16px rgba(237, 137, 54, 0.5);
-    }
-    
-    .metric-card-info {
-        background: linear-gradient(135deg, #667eea 0%, #4c51bf 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
-        transition: transform 0.3s;
-    }
-    
-    .metric-card-info:hover {
-        transform: translateY(-4px);
-    }
-    
-    .metric-card-success {
-        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(72, 187, 120, 0.2);
-        transition: transform 0.3s;
-    }
-    
-    .metric-number {
-        font-size: 2.5rem;
-        font-weight: bold;
-        margin: 8px 0;
-    }
-    
-    .metric-label {
-        font-size: 0.9rem;
-        opacity: 0.9;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    .metric-badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 12px;
-        background: rgba(255,255,255,0.2);
-        font-size: 0.75rem;
-        margin-top: 8px;
-    }
-    
-    /* Enhanced Error Cards */
-    .error-card {
-        border-radius: 12px;
-        padding: 16px;
-        margin: 12px 0;
-        border-left: 6px solid;
-        background: linear-gradient(135deg, #1a2332 0%, #0f1419 100%);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        transition: all 0.3s ease;
-    }
-    
-    .error-card:hover {
-        transform: translateX(8px);
-        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
-    }
-    
-    .error-card-critical {
-        border-left-color: #f56565;
-        background: linear-gradient(135deg, rgba(245, 101, 101, 0.1) 0%, #1a2332 100%);
-    }
-    
-    .error-card-high {
-        border-left-color: #ed8936;
-        background: linear-gradient(135deg, rgba(237, 137, 54, 0.1) 0%, #1a2332 100%);
-    }
-    
-    .error-card-medium {
-        border-left-color: #ecc94b;
-        background: linear-gradient(135deg, rgba(236, 201, 75, 0.1) 0%, #1a2332 100%);
-    }
-    
-    .error-card-low {
-        border-left-color: #48bb78;
-        background: linear-gradient(135deg, rgba(72, 187, 120, 0.1) 0%, #1a2332 100%);
-    }
-    
-    .error-preview {
-        font-size: 0.85rem;
-        color: #a0aec0;
-        margin-top: 8px;
-        padding: 8px;
-        background: rgba(0,0,0,0.2);
-        border-radius: 6px;
-    }
-    
-    .error-quick-fix {
-        color: #48bb78;
-        font-weight: 500;
-    }
-    
-    .error-impact {
-        color: #ed8936;
-        font-weight: 500;
-    }
-    
-    .occurrence-dots {
-        display: inline-flex;
-        gap: 3px;
-        margin-left: 8px;
-    }
-    
-    .occurrence-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: #667eea;
-        display: inline-block;
-    }
-    
-    /* Context Viewer Enhanced */
-    .context-viewer {
-        background: #0d1117;
-        border-radius: 8px;
-        padding: 16px;
-        font-family: 'Courier New', monospace;
-        font-size: 13px;
-        border: 1px solid #30363d;
-        box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);
-    }
-    
-    .context-line-before {
-        color: #6e7681;
-        padding: 3px 8px;
-        display: block;
-        transition: background 0.2s;
-    }
-    
-    .context-line-before:hover {
-        background: rgba(110, 118, 129, 0.1);
-    }
-    
-    .context-line-error {
-        background: rgba(245, 101, 101, 0.15);
-        color: #fc8181;
-        padding: 6px 8px;
-        border-left: 4px solid #f56565;
-        display: block;
-        font-weight: bold;
-        animation: errorPulse 2s infinite;
-    }
-    
-    @keyframes errorPulse {
-        0%, 100% { background: rgba(245, 101, 101, 0.15); }
-        50% { background: rgba(245, 101, 101, 0.25); }
-    }
-    
-    .context-line-after {
-        color: #6e7681;
-        padding: 3px 8px;
-        display: block;
-        transition: background 0.2s;
-    }
-    
-    .context-line-after:hover {
-        background: rgba(110, 118, 129, 0.1);
-    }
-    
-    .line-number {
-        color: #4a5568;
-        margin-right: 16px;
-        min-width: 60px;
-        display: inline-block;
-        user-select: none;
-    }
-    
-    /* Health Meters */
-    .health-meter-container {
-        margin: 12px 0;
-    }
-    
-    .health-meter {
-        height: 8px;
-        background: #2d3748;
-        border-radius: 8px;
-        overflow: hidden;
-        box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);
-    }
-    
-    .health-meter-fill {
-        height: 100%;
-        border-radius: 8px;
-        transition: width 0.8s ease;
-        background: linear-gradient(90deg, #48bb78 0%, #38a169 100%);
-    }
-    
-    .health-meter-fill-warning {
-        background: linear-gradient(90deg, #ecc94b 0%, #d69e2e 100%);
-    }
-    
-    .health-meter-fill-danger {
-        background: linear-gradient(90deg, #f56565 0%, #e53e3e 100%);
-    }
-    
-    /* Component Health Cards */
-    .health-card {
-        background: linear-gradient(135deg, #1a2332 0%, #0f1419 100%);
-        border-radius: 12px;
-        padding: 20px;
-        margin: 12px 0;
-        border: 2px solid;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-        transition: all 0.3s ease;
-    }
-    
-    .health-card:hover {
-        transform: scale(1.02);
-    }
-    
-    .health-card-healthy {
-        border-color: #48bb78;
-    }
-    
-    .health-card-warning {
-        border-color: #ed8936;
-    }
-    
-    .health-card-critical {
-        border-color: #f56565;
-    }
-    
-    .health-emoji {
-        font-size: 3rem;
-        margin-bottom: 12px;
-    }
-    
-    .health-score {
-        font-size: 2rem;
-        font-weight: bold;
-        margin: 8px 0;
-    }
-    
-    .health-trend {
-        font-size: 1.2rem;
-        margin-left: 8px;
-    }
-    
-    /* Timeline Cards */
-    .timeline-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 12px;
-        padding: 20px;
-        color: white;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-        margin: 12px 0;
-    }
-    
-    .timeline-card-warning {
-        background: linear-gradient(135deg, #ed8936 0%, #c05621 100%);
-    }
-    
-    .timeline-card-success {
-        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
-    }
-    
-    /* Action Buttons */
-    .action-button {
-        display: inline-block;
-        padding: 8px 16px;
-        border-radius: 6px;
-        background: #667eea;
-        color: white;
-        text-decoration: none;
-        margin: 4px;
-        transition: all 0.3s;
-        cursor: pointer;
-        border: none;
-        font-size: 0.9rem;
-    }
-    
-    .action-button:hover {
-        background: #764ba2;
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4);
-    }
-    
-    .action-button-danger {
-        background: #f56565;
-    }
-    
-    .action-button-danger:hover {
-        background: #e53e3e;
-    }
-    
-    .action-button-success {
-        background: #48bb78;
-    }
-    
-    .action-button-success:hover {
-        background: #38a169;
-    }
-    
-    /* Search Highlight */
-    .search-highlight {
-        background: #ecc94b;
-        color: #1a202c;
-        padding: 2px 4px;
-        border-radius: 3px;
-        font-weight: bold;
-    }
-    
-    /* Loading Animation */
-    .loading-container {
-        text-align: center;
-        padding: 40px;
-    }
-    
-    .loading-spinner {
-        border: 4px solid #2d3748;
-        border-top: 4px solid #667eea;
-        border-radius: 50%;
-        width: 50px;
-        height: 50px;
-        animation: spin 1s linear infinite;
-        margin: 0 auto;
-    }
-    
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    }
-    
-    /* Breadcrumb */
-    .breadcrumb {
-        color: #a0aec0;
-        font-size: 0.9rem;
-        margin-bottom: 20px;
-    }
-    
-    .breadcrumb a {
-        color: #667eea;
-        text-decoration: none;
-    }
-    
-    .breadcrumb a:hover {
-        text-decoration: underline;
-    }
-    
-    /* Empty State */
-    .empty-state {
-        text-align: center;
-        padding: 60px 20px;
-        color: #a0aec0;
-    }
-    
-    .empty-state-emoji {
-        font-size: 4rem;
-        margin-bottom: 20px;
-    }
-    
-    /* Compact View */
-    .compact-error-item {
-        padding: 8px 12px;
-        margin: 4px 0;
-        border-left: 3px solid;
-        background: rgba(26, 35, 50, 0.5);
-        border-radius: 4px;
-        font-size: 0.85rem;
-        transition: background 0.2s;
-    }
-    
-    .compact-error-item:hover {
-        background: rgba(26, 35, 50, 0.8);
-    }
-    
-    /* Tooltip */
-    .tooltip {
-        position: relative;
-        display: inline-block;
-    }
-    
-    .tooltip .tooltiptext {
-        visibility: hidden;
-        background-color: #2d3748;
-        color: #fff;
-        text-align: center;
-        border-radius: 6px;
-        padding: 8px 12px;
-        position: absolute;
-        z-index: 1;
-        bottom: 125%;
-        left: 50%;
-        margin-left: -60px;
-        opacity: 0;
-        transition: opacity 0.3s;
-        font-size: 0.85rem;
-    }
-    
-    .tooltip:hover .tooltiptext {
-        visibility: visible;
-        opacity: 1;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def get_severity_color(severity: str) -> str:
-    colors = {
-        'CRITICAL': '#f56565',
-        'HIGH': '#ed8936',
-        'MEDIUM': '#ecc94b',
-        'LOW': '#48bb78',
-        'INFO': '#4299e1'
-    }
-    return colors.get(severity, '#a0aec0')
-
-
-def get_severity_emoji(severity: str) -> str:
-    emojis = {
-        'CRITICAL': '🔴',
-        'HIGH': '🟠',
-        'MEDIUM': '🟡',
-        'LOW': '🟢',
-        'INFO': '🔵'
-    }
-    return emojis.get(severity, '⚪')
-
-
-def get_category_icon(category: str) -> str:
-    icons = {
-        'DATABASE': '🗄️',
-        'NULL_POINTER': '⚠️',
-        'NETWORK': '🌐',
-        'AUTHENTICATION': '🔐',
-        'GENERIC': '📦'
-    }
-    return icons.get(category, '📦')
-
-
-def render_occurrence_dots(count: int, max_display: int = 15):
-    """Render visual dots for error occurrences"""
-    dots_html = '<span class="occurrence-dots">'
-    display_count = min(count, max_display)
-    for i in range(display_count):
-        dots_html += '<span class="occurrence-dot"></span>'
-    if count > max_display:
-        dots_html += f'<span style="color: #a0aec0; margin-left: 4px;">+{count - max_display}</span>'
-    dots_html += '</span>'
-    return dots_html
-
-
-def render_health_meter(score: int):
-    """Render visual health meter"""
-    if score >= 75:
-        fill_class = "health-meter-fill"
-    elif score >= 40:
-        fill_class = "health-meter-fill-warning"
-    else:
-        fill_class = "health-meter-fill-danger"
-    
-    html = f"""
-    <div class="health-meter-container">
-        <div class="health-meter">
-            <div class="{fill_class}" style="width: {score}%;"></div>
-        </div>
-    </div>
+class ContextExtractor:
     """
-    return html
+    Extracts surrounding context for each suspicious log
+    Shows 5 lines before and after each error
+    """
 
+    def __init__(self, context_window: int = 5):
+        self.context_window = context_window
 
-def auto_adjust_severity(error: dict, all_errors: list) -> str:
-    """Auto-adjust severity based on context"""
-    original_severity = error.get('severity', 'MEDIUM')
-    component = error.get('component', '').lower()
-    
-    same_errors = [e for e in all_errors
-                  if e.get('exception_class') == error.get('exception_class')
-                  and e.get('component') == error.get('component')]
-    count = len(same_errors)
+    def extract_timestamp(self, log_line: str) -> Optional[str]:
+        """Extract timestamp from log line - supports multiple formats"""
+        
+        # Format 1: Liferay/Java - 2026-02-11 10:15:32 or 2026-02-11T10:15:32
+        match = re.search(r'(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})', log_line)
+        if match:
+            return f"{match.group(1)} {match.group(2)}"
+        
+        # Format 2: Apache Error Log - [Thu Jun 09 06:07:04 2005]
+        match = re.search(r'\[([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\]', log_line)
+        if match:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(match.group(1), '%a %b %d %H:%M:%S %Y')
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                return match.group(1)
+        
+        # Format 3: Apache Access Log - [22/Jan/2019:03:56:14 +0330]
+        match = re.search(r'\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2})', log_line)
+        if match:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(match.group(1), '%d/%b/%Y:%H:%M:%S')
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                return match.group(1)
+        
+        # Format 4: Linux Syslog - Jun 14 15:16:01 (no year!)
+        match = re.search(r'([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', log_line)
+        if match:
+            try:
+                from datetime import datetime
+                current_year = datetime.now().year
+                dt = datetime.strptime(f"{match.group(1)} {current_year}", '%b %d %H:%M:%S %Y')
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                return match.group(1)
 
-    severity_order = ['INFO', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
-    current_idx = severity_order.index(original_severity) if original_severity in severity_order else 2
+        return None
 
-    if count >= 10 and current_idx < 4:
-        current_idx = min(current_idx + 2, 4)
-    elif count >= 5 and current_idx < 4:
-        current_idx = min(current_idx + 1, 4)
+    def get_context(self, logs: list[str], line_index: int) -> dict:
+        """
+        Get context for a specific line
+        Returns: lines before, the error line, lines after
+        """
+        total_lines = len(logs)
 
-    if any(kw in component for kw in ['payment', 'checkout', 'billing', 'auth', 'security']):
-        if current_idx < 4:
-            current_idx = min(current_idx + 1, 4)
+        # Calculate context window bounds
+        start = max(0, line_index - self.context_window)
+        end = min(total_lines - 1, line_index + self.context_window)
 
-    if any(kw in component for kw in ['cache', 'log', 'metric', 'monitor', 'optional']):
-        if current_idx > 0:
-            current_idx = max(current_idx - 1, 0)
-
-    adjusted = severity_order[current_idx]
-
-    if adjusted != original_severity:
-        error['severity_adjusted'] = True
-        error['original_severity'] = original_severity
-
-    return adjusted
-
-
-def check_alert_rules(results: dict, rules: list) -> list:
-    """Check if any alert rules are triggered"""
-    triggered = []
-
-    for rule in rules:
-        matching_errors = []
-
-        for error in results.get('error_events', []):
-            severity_match = (rule['severity'] == 'ANY' or
-                            error.get('severity') == rule['severity'])
-            component_match = (rule['component'] == '' or
-                             rule['component'].lower() in error.get('component', '').lower())
-            keyword_match = (rule['keyword'] == '' or
-                           rule['keyword'].lower() in error.get('message', '').lower() or
-                           rule['keyword'].lower() in error.get('exception_class', '').lower())
-
-            if severity_match and component_match and keyword_match:
-                matching_errors.append(error)
-
-        if matching_errors and len(matching_errors) >= rule.get('min_occurrences', 1):
-            triggered.append({
-                'rule': rule,
-                'matching_errors': matching_errors,
-                'count': len(matching_errors)
+        # Extract context lines
+        before_lines = []
+        for i in range(start, line_index):
+            before_lines.append({
+                'line_number': i + 1,  # 1-indexed for display
+                'content': logs[i],
+                'type': 'before'
             })
 
-    return triggered
+        after_lines = []
+        for i in range(line_index + 1, end + 1):
+            after_lines.append({
+                'line_number': i + 1,
+                'content': logs[i],
+                'type': 'after'
+            })
 
+        return {
+            'line_number': line_index + 1,  # 1-indexed for display
+            'line_index': line_index,        # 0-indexed internal
+            'log_line': logs[line_index],
+            'timestamp': self.extract_timestamp(logs[line_index]),
+            'before_context': before_lines,
+            'after_context': after_lines,
+            'context_start_line': start + 1,
+            'context_end_line': end + 1
+        }
 
-def highlight_search_text(text: str, search_query: str) -> str:
-    """Highlight search query in text"""
-    if not search_query:
-        return text
-    
-    pattern = re.compile(re.escape(search_query), re.IGNORECASE)
-    return pattern.sub(lambda m: f'<span class="search-highlight">{m.group()}</span>', text)
+    def extract_all_contexts(self, logs: list[str], suspicious_indices: list[int]) -> list[dict]:
+        """Extract context for all suspicious log lines"""
+        contexts = []
+        for idx in suspicious_indices:
+            if idx < len(logs):
+                context = self.get_context(logs, idx)
+                contexts.append(context)
+        return contexts
 
+    def detect_related_errors(self, contexts: list[dict]) -> list[dict]:
+        """
+        Detect errors that happened close together (within 5 seconds)
+        These are likely related/caused by each other
+        """
+        chains = []
+        current_chain = []
 
-def render_sticky_summary(results: dict):
-    """Render sticky summary bar at top"""
-    critical_count = len([e for e in results['error_events'] if e.get('severity') == 'CRITICAL'])
-    high_count = len([e for e in results['error_events'] if e.get('severity') == 'HIGH'])
-    total_logs = results['total_logs']
-    processing_time = results.get('processing_time', 0)
-    
-    html = f"""
-    <div class="sticky-summary">
-        <div class="sticky-item sticky-critical">
-            <span>🔴</span>
-            <span>{critical_count} CRITICAL</span>
-        </div>
-        <div class="sticky-item sticky-high">
-            <span>🟠</span>
-            <span>{high_count} HIGH</span>
-        </div>
-        <div class="sticky-item sticky-info">
-            <span>📄</span>
-            <span>{total_logs:,} Logs</span>
-        </div>
-        <div class="sticky-item sticky-info">
-            <span>⏱️</span>
-            <span>{processing_time:.1f}s</span>
-        </div>
-        <div class="sticky-item sticky-info">
-            <span>✅</span>
-            <span>{len(results['error_events'])} Errors Found</span>
-        </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+        for i, ctx in enumerate(contexts):
+            if i == 0:
+                current_chain = [ctx]
+                continue
 
+            prev_ts = contexts[i-1].get('timestamp')
+            curr_ts = ctx.get('timestamp')
 
-def render_context_viewer(error: dict, search_query: str = ""):
-    """Render enhanced context viewer"""
-    if not error.get('line_number'):
-        st.info("📍 Line number not available for this error")
-        return
+            if prev_ts and curr_ts:
+                try:
+                    prev_time = datetime.strptime(prev_ts, "%Y-%m-%d %H:%M:%S")
+                    curr_time = datetime.strptime(curr_ts, "%Y-%m-%d %H:%M:%S")
+                    diff = (curr_time - prev_time).total_seconds()
 
-    st.markdown(f"**📍 Location:** Line `{error['line_number']:,}` in log file")
-
-    if error.get('timestamp'):
-        st.markdown(f"**🕐 Timestamp:** `{error['timestamp']}`")
-
-    before_ctx = error.get('before_context', [])
-    after_ctx = error.get('after_context', [])
-
-    if before_ctx or after_ctx:
-        context_html = '<div class="context-viewer">'
-
-        for line in before_ctx:
-            line_num = line['line_number']
-            content = highlight_search_text(line['content'][:200], search_query)
-            context_html += f'<span class="context-line-before"><span class="line-number">{line_num}</span>{content}</span>'
-
-        error_line = highlight_search_text(error.get("log_line", "")[:200], search_query)
-        context_html += f'<span class="context-line-error"><span class="line-number">→ {error["line_number"]}</span>{error_line}</span>'
-
-        for line in after_ctx:
-            line_num = line['line_number']
-            content = highlight_search_text(line['content'][:200], search_query)
-            context_html += f'<span class="context-line-after"><span class="line-number">{line_num}</span>{content}</span>'
-
-        context_html += '</div>'
-        st.markdown(context_html, unsafe_allow_html=True)
-    else:
-        st.code(error.get('log_line', 'No log line available'), language='text')
-
-
-def render_component_health(results: dict):
-    """Enhanced component health dashboard with visual meters"""
-    st.subheader("🏥 Component Health Dashboard")
-
-    component_stats = defaultdict(lambda: {
-        'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0, 'total': 0
-    })
-
-    for error in results.get('error_events', []):
-        component = error.get('component', 'Unknown')
-        severity = error.get('severity', 'LOW').lower()
-        component_stats[component]['total'] += 1
-        # Safely increment only if severity key exists
-        if severity in component_stats[component]:
-            component_stats[component][severity] += 1
-
-    if not component_stats:
-        st.info("No component data available")
-        return
-
-    def calculate_health_score(stats):
-        score = 100
-        score -= stats.get('critical', 0) * 25
-        score -= stats.get('high', 0) * 10
-        score -= stats.get('medium', 0) * 5
-        score -= stats.get('low', 0) * 2
-        score -= stats.get('info', 0) * 1  # Info has minimal impact
-        return max(0, score)
-
-    components_sorted = sorted(
-        component_stats.items(),
-        key=lambda x: calculate_health_score(x[1])
-    )
-
-    # Show needs attention banner
-    critical_components = [
-        (comp, calculate_health_score(stats))
-        for comp, stats in components_sorted
-        if calculate_health_score(stats) < 75
-    ]
-    
-    if critical_components:
-        st.warning(f"⚠️ **{len(critical_components)} Component(s) Need Attention**")
-
-    # Display health cards in grid
-    cols = st.columns(min(len(components_sorted), 3))
-
-    for i, (component, stats) in enumerate(components_sorted):
-        score = calculate_health_score(stats)
-        col = cols[i % 3]
-
-        with col:
-            if score >= 75:
-                health_emoji = "✅"
-                health_color = "#48bb78"
-                health_label = "Healthy"
-                card_class = "health-card-healthy"
-            elif score >= 40:
-                health_emoji = "⚠️"
-                health_color = "#ed8936"
-                health_label = "Warning"
-                card_class = "health-card-warning"
+                    if abs(diff) <= 5:  # Within 5 seconds = likely related
+                        current_chain.append(ctx)
+                    else:
+                        if len(current_chain) > 1:
+                            chains.append({
+                                'errors': current_chain,
+                                'count': len(current_chain),
+                                'start_time': current_chain[0].get('timestamp'),
+                                'end_time': current_chain[-1].get('timestamp')
+                            })
+                        current_chain = [ctx]
+                except:
+                    current_chain = [ctx]
             else:
-                health_emoji = "🔴"
-                health_color = "#f56565"
-                health_label = "Critical"
-                card_class = "health-card-critical"
+                current_chain = [ctx]
 
-            html = f"""
-            <div class="health-card {card_class}">
-                <div class="health-emoji">{health_emoji}</div>
-                <div style="font-weight: bold; color: white; font-size: 1.1rem;">{component}</div>
-                <div style="color: {health_color}; font-size: 0.9rem; margin: 4px 0;">{health_label}</div>
-                {render_health_meter(score)}
-                <div class="health-score" style="color: {health_color};">{score}/100</div>
-                <div style="color: #a0aec0; font-size: 0.8rem; margin-top: 8px;">
-                    🔴 {stats['critical']} | 🟠 {stats['high']} | 🟡 {stats['medium']} | 🟢 {stats['low']} | 🔵 {stats['info']}
-                </div>
-            </div>
-            """
-            st.markdown(html, unsafe_allow_html=True)
+        if len(current_chain) > 1:
+            chains.append({
+                'errors': current_chain,
+                'count': len(current_chain),
+                'start_time': current_chain[0].get('timestamp'),
+                'end_time': current_chain[-1].get('timestamp')
+            })
 
-    # Detailed table
-    st.markdown("### 📊 Detailed Health Table")
-    health_data = []
-    for component, stats in components_sorted:
-        score = calculate_health_score(stats)
-        health_data.append({
-            'Component': component,
-            'Health Score': f"{score}/100",
-            'Critical': stats['critical'],
-            'High': stats['high'],
-            'Medium': stats['medium'],
-            'Low': stats['low'],
-            'Info': stats['info'],
-            'Total Errors': stats['total'],
-            'Status': '🔴 Critical' if score < 40 else '⚠️ Warning' if score < 75 else '✅ Healthy'
-        })
-
-    df = pd.DataFrame(health_data)
-    st.dataframe(df, use_container_width=True)
+        return chains
 
 
 # ============================================================================
-# HEADER
+# LIVE DASHBOARD
 # ============================================================================
 
-st.markdown('<h1 class="main-header">🔥 CRYSYS v3.0</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align: center; color: #718096; font-size: 1.2rem;">Ultimate Log Analysis Portal - Enhanced Edition</p>', unsafe_allow_html=True)
-st.markdown("---")
+class LiveDashboard:
+    """Real-time progress display"""
+
+    def __init__(self):
+        self.stats = {
+            'total_logs': 0,
+            'processed_logs': 0,
+            'suspicious_found': 0,
+            'cache_hits': 0,
+            'errors_analyzed': 0,
+            'current_stage': 'Initializing'
+        }
+
+    def update(self, **kwargs):
+        self.stats.update(kwargs)
+
+    def get_table(self) -> Table:
+        table = Table(title="[bold cyan]CRYSYS v3.0 - Live Analysis[/bold cyan]", show_header=False)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="yellow")
+
+        if self.stats['total_logs'] > 0:
+            pct = (self.stats['processed_logs'] / self.stats['total_logs']) * 100
+            table.add_row("Progress", f"{self.stats['processed_logs']}/{self.stats['total_logs']} ({pct:.1f}%)")
+
+        table.add_row("Current Stage", self.stats['current_stage'])
+        table.add_row("Suspicious Found", str(self.stats['suspicious_found']))
+        table.add_row("Cache Hits", str(self.stats['cache_hits']))
+        table.add_row("Errors Analyzed", str(self.stats['errors_analyzed']))
+
+        return table
+
 
 # ============================================================================
-# SIDEBAR
+# MAIN SYSTEM
 # ============================================================================
 
-with st.sidebar:
-    st.header("⚙️ Settings")
+class UltimateCRYSYS:
+    """CRYSYS v3.0 with all improvements including context tracking"""
 
-    api_key = st.text_input(
-        "Groq API Key",
-        value="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",
-        type="password"
-    )
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "llama-3.3-70b-versatile",
+        max_input_tokens: int = 6000,
+        enable_parallel: bool = True,
+        enable_cache: bool = True,
+        enable_dashboard: bool = True,
+        context_window: int = 5  # NEW: lines of context to show
+    ):
+        self.llm = ChatGroq(api_key=api_key, model=model, temperature=0.3, max_tokens=2000)
+        self.max_input_tokens = max_input_tokens
+        self.total_tokens_used = 0
+        self.enable_parallel = enable_parallel
+        self.enable_cache = enable_cache
+        self.enable_dashboard = enable_dashboard
 
-    enable_cache = st.checkbox("Enable Cache", value=True)
-    enable_parallel = st.checkbox("Enable Parallel Processing", value=True)
+        # Systems
+        self.memory = PatternMemory() if enable_cache else None
+        self.dashboard = LiveDashboard() if enable_dashboard else None
+        self.context_extractor = ContextExtractor(context_window=context_window)  # NEW
 
-    context_window = st.slider(
-        "Context Window (lines before/after error)",
-        min_value=2,
-        max_value=10,
-        value=5,
-        help="How many lines to show before and after each error"
-    )
-
-    st.markdown("---")
-    
-    # View mode toggle
-    st.subheader("🎨 Display Options")
-    st.session_state.view_mode_compact = st.checkbox("Compact View", value=False)
-
-    st.markdown("---")
-
-    # Alert Rules Section
-    st.header("🔔 Alert Rules")
-
-    with st.expander("➕ Add New Rule"):
-        rule_severity = st.selectbox("Severity", ['ANY', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'])
-        rule_component = st.text_input("Component (optional)", placeholder="e.g. PaymentService")
-        rule_keyword = st.text_input("Keyword (optional)", placeholder="e.g. timeout")
-        rule_min_occurrences = st.number_input("Min Occurrences", min_value=1, value=1)
-        rule_action = st.selectbox("Action", ['Show Alert', 'Flag as Critical', 'Highlight'])
-
-        if st.button("Add Rule", type="primary"):
-            new_rule = {
-                'id': len(st.session_state.alert_rules),
-                'severity': rule_severity,
-                'component': rule_component,
-                'keyword': rule_keyword,
-                'min_occurrences': rule_min_occurrences,
-                'action': rule_action
-            }
-            st.session_state.alert_rules.append(new_rule)
-            st.success(f"✅ Rule added!")
-
-    if st.session_state.alert_rules:
-        st.markdown("**Active Rules:**")
-        for i, rule in enumerate(st.session_state.alert_rules):
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(f"Rule {i+1}: {rule['severity']} | {rule['component'] or 'Any'} | {rule['keyword'] or 'Any'}")
-            with col2:
-                if st.button("❌", key=f"del_rule_{i}"):
-                    st.session_state.alert_rules.pop(i)
-                    st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 📊 About")
-    st.info("CRYSYS v3.0 Enhanced Edition with visual improvements")
-
-    if st.session_state.analysis_complete:
-        if st.button("🔄 New Analysis"):
-            st.session_state.results = None
-            st.session_state.analysis_complete = False
-            st.session_state.grouped_errors = None
-            st.session_state.timeline_data = None
-            st.rerun()
-
-# ============================================================================
-# MAIN CONTENT
-# ============================================================================
-
-if not st.session_state.analysis_complete:
-
-    st.markdown('<div class="breadcrumb">Home > Upload</div>', unsafe_allow_html=True)
-    
-    st.header("📁 Upload Log File")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col2:
-        uploaded_file = st.file_uploader(
-            "Choose a log file",
-            type=['log', 'txt'],
-            help="Upload .log or .txt files"
-        )
-
-        if uploaded_file:
-            file_size = len(uploaded_file.getvalue())
-            st.success(f"✅ **{uploaded_file.name}** ({file_size / 1024 / 1024:.2f} MB)")
-
-            with st.expander("👀 Preview First 20 Lines"):
-                preview = uploaded_file.getvalue().decode('utf-8', errors='ignore').split('\n')[:20]
-                st.code('\n'.join(preview))
-
-            st.markdown("---")
-
-            if st.button("🚀 Analyze Log File", type="primary", use_container_width=True):
-                temp_path = Path("temp_upload.log")
-                with open(temp_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-
-                # Enhanced loading animation
-                st.markdown("""
-                <div class="loading-container">
-                    <div class="loading-spinner"></div>
-                    <p style="margin-top: 20px; color: #667eea; font-weight: bold;">Analyzing your logs...</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                status_placeholder = st.empty()
-                
-                status_placeholder.info("📖 Reading log file...")
-                
-                with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    logs = [line.strip() for line in f if line.strip()]
-
-                status_placeholder.info(f"✅ Loaded {len(logs):,} lines")
-
-                status_placeholder.info("🤖 Initializing CRYSYS analyzer...")
-
-                analyzer = UltimateCRYSYS(
-                    api_key=api_key,
-                    enable_parallel=enable_parallel,
-                    enable_cache=enable_cache,
-                    enable_dashboard=False,
-                    context_window=context_window
-                )
-
-                status_placeholder.info("🔍 Running AI analysis (this may take a few minutes)...")
-
-                results = analyzer.analyze_logs(logs)
-
-                # Post-process
-                for error in results.get('error_events', []):
-                    error['severity'] = auto_adjust_severity(error, results['error_events'])
-
-                # Group errors
-                grouper = ErrorGrouper()
-                grouped = grouper.create_grouped_summary(results['error_events'])
-                st.session_state.grouped_errors = grouped
-
-                # Timeline analysis
-                timeline_analyzer = TimelineAnalyzer()
-                timeline_data = timeline_analyzer.analyze_timeline(
-                    results['error_events'],
-                    logs,
-                    results['suspicious_indices']
-                )
-                st.session_state.timeline_data = timeline_data
-
-                # Check alert rules
-                if st.session_state.alert_rules:
-                    triggered = check_alert_rules(results, st.session_state.alert_rules)
-                    st.session_state.triggered_alerts = triggered
-
-                results['job_id'] = datetime.now().strftime('%Y%m%d_%H%M%S')
-                results['filename'] = uploaded_file.name
-                results['timestamp'] = datetime.now().isoformat()
-
-                st.session_state.results = results
-                st.session_state.analysis_complete = True
-
-                status_placeholder.success("✅ Analysis complete!")
-
-                if temp_path.exists():
-                    temp_path.unlink()
-
-                st.balloons()
-                st.rerun()
-
-else:
-    # ============================================================================
-    # RESULTS DISPLAY WITH STICKY SUMMARY
-    # ============================================================================
-
-    results = st.session_state.results
-    
-    # Breadcrumb
-    st.markdown(f'<div class="breadcrumb">Home > Results > {results.get("filename", "Analysis")}</div>', unsafe_allow_html=True)
-
-    # Sticky summary bar
-    render_sticky_summary(results)
-
-    # Alert notifications
-    if st.session_state.triggered_alerts:
-        st.error(f"🚨 **{len(st.session_state.triggered_alerts)} Alert Rule(s) Triggered!**")
-        for alert in st.session_state.triggered_alerts:
-            rule = alert['rule']
-            st.warning(
-                f"⚠️ Rule triggered: **{rule['severity']}** errors "
-                f"in **{rule['component'] or 'any component'}** "
-                f"({alert['count']} occurrences) → Action: {rule['action']}"
-            )
-        st.markdown("---")
-
-    # Executive Summary
-    st.header("📋 Executive Summary")
-
-    if results['requires_immediate_attention']:
-        st.error(f"🔴 **CRITICAL - Immediate Action Required!**\n\n{results['final_summary']}")
-    else:
-        st.success(f"🟢 **System Status: Normal**\n\n{results['final_summary']}")
-
-    st.markdown("---")
-
-    # Clean Key Metrics
-    st.header("📊 Key Metrics")
-
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("📄 Total Logs", f"{results['total_logs']:,}")
-    
-    with col2:
-        suspicious_pct = (len(results['suspicious_indices']) / results['total_logs'] * 100) if results['total_logs'] > 0 else 0
-        st.metric("⚠️ Suspicious", len(results['suspicious_indices']), f"{suspicious_pct:.1f}%")
-    
-    with col3:
-        st.metric("❌ Confirmed Errors", len(results['error_events']))
-    
-    with col4:
-        critical_count = len([e for e in results['error_events'] if e.get('severity') == 'CRITICAL'])
-        st.metric("🔴 Critical", critical_count, "Urgent!" if critical_count > 0 else None, delta_color="inverse")
-
-    # Second row
-    col5, col6, col7 = st.columns(3)
-    
-    with col5:
-        high_count = len([e for e in results['error_events'] if e.get('severity') == 'HIGH'])
-        st.metric("🟠 High Priority", high_count)
-    
-    with col6:
-        cache_efficiency = (results.get('cache_hits', 0) / results['total_logs'] * 100) if results['total_logs'] > 0 else 0
-        st.metric("⚡ Cache Efficiency", f"{cache_efficiency:.1f}%")
-    
-    with col7:
-        st.metric("⏱️ Processing Time", f"{results.get('processing_time', 0):.1f}s")
-
-    st.markdown("---")
-
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📈 Timeline",
-        "🔍 Error Analysis",
-        "🔗 Related Errors",
-        "🏥 Component Health",
-        "📊 Visualizations",
-        "💡 Recommendations",
-        "💾 Export"
-    ])
+        console.print(Panel.fit(
+            "[bold cyan]CRYSYS v3.0[/bold cyan]\n"
+            "[dim]Now with Context Tracking, Timeline Analysis & Error Grouping[/dim]"
+        ))
 
     # ========================================================================
-    # TAB 1: ENHANCED TIMELINE
+    # UTILITIES
     # ========================================================================
 
-    with tab1:
-        st.header("📈 Error Timeline")
+    def estimate_tokens(self, text: str) -> int:
+        return len(text) // 4
 
-        timeline_data = st.session_state.timeline_data
+    def chunk_logs(self, logs: list[str], chunk_size: int = 25) -> list[list[str]]:
+        chunks = []
+        current = []
+        current_tokens = 0
 
-        if timeline_data and timeline_data.get('has_timestamps'):
-            # Error storms
-            if timeline_data.get('error_storms'):
-                st.markdown(f"""
-                <div class="timeline-card-warning">
-                    <h3>⚡ {len(timeline_data['error_storms'])} Error Storm(s) Detected!</h3>
-                    <p>Sudden spike in error frequency detected</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                for storm in timeline_data['error_storms']:
-                    st.error(f"🌩️ Storm at **{storm['time']}** - {storm['count']} errors")
+        for log in logs:
+            log_tokens = self.estimate_tokens(log[:500])
+            if (current_tokens + log_tokens > self.max_input_tokens or
+                len(current) >= chunk_size) and current:
+                chunks.append(current)
+                current = [log]
+                current_tokens = log_tokens
+            else:
+                current.append(log)
+                current_tokens += log_tokens
 
-            # Enhanced timeline chart
-            time_buckets = timeline_data.get('time_buckets', {})
-            if time_buckets:
-                df_timeline = pd.DataFrame(
-                    list(time_buckets.items()),
-                    columns=['Time', 'Error Count']
-                )
+        if current:
+            chunks.append(current)
 
-                # Create interactive plotly chart
-                fig = go.Figure()
-                
-                fig.add_trace(go.Scatter(
-                    x=df_timeline['Time'],
-                    y=df_timeline['Error Count'],
-                    mode='lines+markers',
-                    name='Errors',
-                    line=dict(color='#667eea', width=3),
-                    marker=dict(size=8, color='#764ba2'),
-                    fill='tozeroy',
-                    fillcolor='rgba(102, 126, 234, 0.2)',
-                    hovertemplate='<b>Time:</b> %{x}<br><b>Errors:</b> %{y}<extra></extra>'
-                ))
-                
-                fig.update_layout(
-                    title="Error Frequency Over Time (Hover for details)",
-                    xaxis_title="Time",
-                    yaxis_title="Number of Errors",
-                    xaxis_tickangle=-45,
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    hovermode='x unified',
-                    height=400
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
+        return chunks
 
-            # Timeline stats - cleaner version
-            st.markdown("### ⏰ Timeline Summary")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                start_time_str = timeline_data.get('start_time', 'Unknown')
-                if start_time_str != 'Unknown':
-                    try:
-                        dt = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-                        start_display = dt.strftime('%Y-%m-%d %H:%M:%S')
-                    except:
-                        start_display = start_time_str[:19]
-                else:
-                    start_display = 'Unknown'
-                st.info(f"**📅 Start Time**\n\n{start_display}")
-                
-            with col2:
-                end_time_str = timeline_data.get('end_time', 'Unknown')
-                if end_time_str != 'Unknown':
-                    try:
-                        dt = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                        end_display = dt.strftime('%Y-%m-%d %H:%M:%S')
-                    except:
-                        end_display = end_time_str[:19]
-                else:
-                    end_display = 'Unknown'
-                st.info(f"**📅 End Time**\n\n{end_display}")
-            
-            with col3:
-                peak_time_str = timeline_data.get('peak_time', 'Unknown')
-                if peak_time_str != 'Unknown':
-                    try:
-                        if 'T' in peak_time_str or len(peak_time_str) > 16:
-                            dt = datetime.fromisoformat(peak_time_str.replace('Z', '+00:00'))
-                            peak_display = dt.strftime('%Y-%m-%d %H:%M')
-                        else:
-                            peak_display = peak_time_str
-                    except:
-                        peak_display = peak_time_str
-                else:
-                    peak_display = 'Unknown'
-                st.warning(f"**⚡ Peak Time**\n\n{peak_display}")
-                
-            with col4:
-                peak_count = timeline_data.get('peak_count', 0)
-                st.warning(f"**📊 Peak Count**\n\n{peak_count} errors")
-            
-            # Duration
-            duration_seconds = timeline_data.get('duration_seconds', 0)
-            if duration_seconds > 0:
-                hours = int(duration_seconds // 3600)
-                minutes = int((duration_seconds % 3600) // 60)
-                seconds = int(duration_seconds % 60)
-                
-                if hours > 0:
-                    duration_display = f"{hours}h {minutes}m {seconds}s"
-                elif minutes > 0:
-                    duration_display = f"{minutes}m {seconds}s"
-                else:
-                    duration_display = f"{seconds}s"
-                    
-                st.success(f"**⏱️ Total Duration:** {duration_display}")
+    def safe_llm_call(self, prompt: str, system_msg: str) -> Optional[dict]:
+        for attempt in range(2):
+            try:
+                response = self.llm.invoke([
+                    SystemMessage(content=system_msg),
+                    HumanMessage(content=prompt)
+                ])
 
-        else:
-            st.markdown("""
-            <div class="empty-state">
-                <div class="empty-state-emoji">⏰</div>
-                <h3>No Timestamps Found</h3>
-                <p>Timeline analysis requires timestamped log entries</p>
-                <p style="color: #667eea;">Expected format: <code>2026-02-11 10:15:32 ERROR [Component] Message</code></p>
-            </div>
-            """, unsafe_allow_html=True)
+                self.total_tokens_used += self.estimate_tokens(prompt + response.content)
+                content = response.content.strip()
+
+                if '{' in content:
+                    start = content.find('{')
+                    end = content.rfind('}') + 1
+                    content = content[start:end]
+
+                return json.loads(content)
+
+            except json.JSONDecodeError as e:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                return None
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return None
+
+        return None
+
+    def keyword_screen(self, logs: list[str], offset: int = 0) -> list[int]:
+        suspicious = []
+        keywords = ['error', 'exception', 'failed', 'fatal', 'critical', 'null', 'timeout']
+
+        for i, log in enumerate(logs):
+            log_lower = log.lower()
+            if any(kw in log_lower for kw in keywords):
+                if not any(level in log_lower for level in ['info:', 'debug:', 'trace:']):
+                    suspicious.append(i + offset)
+
+        return suspicious
 
     # ========================================================================
-    # TAB 2: ENHANCED ERROR ANALYSIS
+    # SCREENING WITH CONTEXT TRACKING (NEW!)
     # ========================================================================
 
-    with tab2:
-        st.header("🔍 Detailed Error Analysis")
+    def create_fewshot_screening_prompt(self, chunk: list[str], offset: int) -> str:
+        return f"""You are an expert log screener. Learn from these examples:
 
-        # Enhanced filters
-        st.subheader("🎛️ Filters")
-        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+EXAMPLE 1 - SUSPICIOUS ✓
+"2026-01-20 10:15:32 ERROR [UserService] NullPointerException at line 245"
+→ MARK AS SUSPICIOUS (ERROR + Exception)
 
-        with filter_col1:
-            severity_filter = st.multiselect(
-                "⚠️ Severity",
-                options=['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'],
-                default=['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
-            )
+EXAMPLE 2 - NOT SUSPICIOUS ✗
+"2026-01-20 10:15:33 INFO [SystemService] User login successful"
+→ DO NOT MARK (INFO level, normal operation)
 
-        with filter_col2:
-            categories = list(set([e.get('category', 'GENERIC') for e in results['error_events']]))
-            category_filter = st.multiselect(
-                "🏷️ Category",
-                options=categories,
-                default=categories
-            )
+EXAMPLE 3 - SUSPICIOUS ✓
+"2026-01-20 10:15:34 FATAL [DatabasePool] Connection timeout after 30s"
+→ MARK AS SUSPICIOUS (FATAL + timeout)
 
-        with filter_col3:
-            min_confidence = st.slider("🎯 Min Confidence", 0, 100, 0)
+EXAMPLE 4 - NOT SUSPICIOUS ✗
+"2026-01-20 10:15:35 DEBUG [CacheManager] Cache hit for user_12345"
+→ DO NOT MARK (DEBUG, successful operation)
 
-        with filter_col4:
-            search_query = st.text_input("🔎 Search", placeholder="Search errors...")
+STRICT RULES:
+✓ MARK if contains: ERROR, FATAL, CRITICAL, Exception, Failed, Timeout, Refused, Denied
+✗ DO NOT MARK if: INFO, DEBUG, TRACE, successful, completed, started
 
-        components = list(set([e.get('component', 'Unknown') for e in results['error_events']]))
-        component_filter = st.multiselect(
-            "🔧 Component Filter",
-            options=components,
-            default=components
-        )
+Now screen these logs (indices {offset} to {offset + len(chunk) - 1}):
 
-        view_mode = st.radio(
-            "View Mode",
-            ["Grouped (Deduplicated)", "Individual Errors"],
-            horizontal=True
-        )
+{chr(10).join([f"{i+offset}: {log[:200]}" for i, log in enumerate(chunk)])}
 
-        # Apply filters
-        filtered_errors = [
-            e for e in results['error_events']
-            if e.get('severity', 'INFO') in severity_filter
-            and e.get('category', 'GENERIC') in category_filter
-            and (e.get('confidence', 0) * 100) >= min_confidence
-            and e.get('component', 'Unknown') in component_filter
-            and (not search_query or
-                 search_query.lower() in e.get('message', '').lower() or
-                 search_query.lower() in e.get('exception_class', '').lower() or
-                 search_query.lower() in e.get('component', '').lower())
+Return ONLY valid JSON:
+{{"suspicious_indices": [1, 5, 12], "confidence": 0.92}}
+
+Be SELECTIVE - most logs are normal!"""
+
+    def agent_screen_logs(self, state: AnalysisState) -> AnalysisState:
+        """
+        Screen logs with context tracking.
+        Now captures line numbers and surrounding context for each suspicious log.
+        """
+        console.print("\n[bold cyan]🔍 Screening with Context Tracking[/bold cyan]")
+
+        if self.dashboard:
+            self.dashboard.update(current_stage="Screening")
+
+        all_logs = state['logs']
+        total_logs = len(all_logs)
+        all_suspicious = []
+        cache_hits = 0
+
+        # Keyword Pre-filter - Updated for multiple log formats
+        console.print(f"[cyan]Step 1: Keyword pre-filter on {total_logs:,} logs...[/cyan]")
+
+        error_keywords = [
+            # General error keywords
+            'error', 'exception', 'failed', 'fatal', 'critical',
+            'timeout', 'refused', 'unavailable', 'failure', 'warn',
+            'nullpointer', 'stacktrace', 'caused by',
+            # Apache/Linux specific
+            'authentication failure', 'connection refused', 
+            'cannot create', 'abnormally', 'denied',
+            # HTTP error codes
+            ' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ',
+            # System errors
+            'segfault', 'core dumped', 'panic'
+        ]
+        
+        safe_indicators = [
+            'info  ', 'debug ', 'trace ', 'notice ',
+            # Apache notice (not error)
+            '[notice]',
+            # Successful operations
+            'success', 'ok /etc', 'resuming normal', 'configured',
+            'session opened', 'session closed',
+            # HTTP success codes
+            ' 200 ', ' 201 ', ' 204 ', ' 301 ', ' 302 '
         ]
 
-        st.info(f"📋 Showing **{len(filtered_errors)}** of **{len(results['error_events'])}** errors")
+        keyword_candidates = []
 
-        # Render errors with enhanced cards
-        if view_mode == "Grouped (Deduplicated)" and st.session_state.grouped_errors:
-            grouper = ErrorGrouper()
-            filtered_groups = grouper.create_grouped_summary(filtered_errors)
+        for i, log in enumerate(all_logs):
+            log_lower = log.lower()
+            if any(safe in log_lower for safe in safe_indicators):
+                if not any(kw in log_lower for kw in error_keywords):
+                    continue
+            if any(kw in log_lower for kw in error_keywords):
+                keyword_candidates.append((i, log))
 
-            if not st.session_state.view_mode_compact:
-                # Full view with enhanced cards
-                for group in filtered_groups:
-                    rep_error = group['representative_error']
-                    severity = rep_error.get('severity', 'INFO')
-                    
-                    # Get first root cause and action for preview
-                    quick_fix = rep_error.get('recommended_actions', ['Investigate'])[0] if rep_error.get('recommended_actions') else 'Investigate'
-                    root_cause = rep_error.get('possible_root_causes', ['Unknown'])[0] if rep_error.get('possible_root_causes') else 'Unknown'
+        console.print(f"[green]  ✓ Pre-filter: {total_logs:,} → {len(keyword_candidates):,} candidates[/green]")
 
-                    with st.expander(
-                        f"{get_severity_emoji(severity)} **{rep_error.get('exception_class', 'Unknown')}** | "
-                        f"{rep_error.get('component', 'Unknown')} | "
-                        f"Occurred **{group['occurrences']}x** {render_occurrence_dots(group['occurrences'])} | {severity}",
-                        expanded=(severity in ['CRITICAL', 'HIGH'] and group['occurrences'] >= 5)
-                    ):
-                        # Enhanced error card with preview
-                        error_card_html = f"""
-                        <div class="error-card error-card-{severity.lower()}">
-                            <div class="error-preview">
-                                <div class="error-quick-fix">💡 Quick Fix: {quick_fix}</div>
-                                <div class="error-impact">⚠️ Root Cause: {root_cause}</div>
-                            </div>
-                        </div>
-                        """
-                        st.markdown(error_card_html, unsafe_allow_html=True)
+        if len(keyword_candidates) == 0:
+            state['suspicious_indices'] = []
+            state['suspicious_with_context'] = []
+            state['cache_hits'] = total_logs
+            state['cache_misses'] = 0
+            state['screening_confidence'] = 1.0
+            state['current_stage'] = 'routing'
+            return state
 
-                        col_a, col_b = st.columns([2, 1])
+        # STEP 2: Cache Check
+        console.print(f"[cyan]Step 2: Cache check on {len(keyword_candidates):,} candidates...[/cyan]")
 
-                        with col_a:
-                            st.markdown(f"### {get_category_icon(rep_error.get('category', 'GENERIC'))} Error Details")
-                            st.write(f"**Exception:** {rep_error.get('exception_class', 'Unknown')}")
-                            st.write(f"**Component:** {rep_error.get('component', 'Unknown')}")
-                            st.write(f"**Category:** {rep_error.get('category', 'GENERIC')}")
+        unknown_candidates = []
 
-                            if rep_error.get('severity_adjusted'):
-                                st.warning(f"⚡ Severity auto-adjusted: {rep_error.get('original_severity')} → {severity} (occurs {group['occurrences']}x)")
+        if self.enable_cache and self.memory:
+            for orig_idx, log in keyword_candidates:
+                if self.memory.is_known_critical(log):
+                    all_suspicious.append(orig_idx)
+                    cache_hits += 1
+                elif self.memory.is_known_safe(log):
+                    cache_hits += 1
+                else:
+                    unknown_candidates.append((orig_idx, log))
+            console.print(f"[green]  ✓ Cache: {cache_hits} known, {len(unknown_candidates)} need LLM[/green]")
+        else:
+            unknown_candidates = keyword_candidates
 
-                            if rep_error.get('message'):
-                                st.markdown("**Message:**")
-                                highlighted_msg = highlight_search_text(rep_error['message'], search_query)
-                                st.markdown(f'<div style="background: rgba(102, 126, 234, 0.1); padding: 12px; border-radius: 6px;">{highlighted_msg}</div>', unsafe_allow_html=True)
+        if self.dashboard:
+            self.dashboard.update(cache_hits=cache_hits)
 
-                        with col_b:
-                            st.markdown("### 📊 Metrics")
-                            st.metric("Occurrences", group['occurrences'])
-                            st.metric("Severity", severity)
-                            st.metric("Confidence", f"{rep_error.get('confidence', 0)*100:.0f}%")
+        # STEP 3: LLM Confirmation
+        if unknown_candidates:
+            MAX_LLM_CANDIDATES = 500
+            MAX_LLM_CHUNKS = 10
+            CHUNK_SIZE = 25
+            DELAY_BETWEEN_CALLS = 1.5
 
-                            if group['line_numbers']:
-                                st.markdown(f"**Lines:** {', '.join(map(str, group['line_numbers'][:5]))}")
-                                if len(group['line_numbers']) > 5:
-                                    st.markdown(f"... and {len(group['line_numbers'])-5} more")
-
-                        if group['first_seen'] or group['last_seen']:
-                            st.markdown("### 🕐 Occurrence Timeline")
-                            timeline_col1, timeline_col2 = st.columns(2)
-                            with timeline_col1:
-                                if group['first_seen']:
-                                    st.info(f"**First seen:** {group['first_seen']}")
-                            with timeline_col2:
-                                if group['last_seen']:
-                                    st.info(f"**Last seen:** {group['last_seen']}")
-
-                        if rep_error.get('line_number'):
-                            st.markdown("### 📍 Error Location & Context")
-                            render_context_viewer(rep_error, search_query)
-
-                        if rep_error.get('reasoning'):
-                            st.markdown("### 💭 Analysis Reasoning")
-                            st.warning(rep_error['reasoning'])
-
-                        if rep_error.get('possible_root_causes'):
-                            st.markdown("### 🔍 Possible Root Causes")
-                            for cause in rep_error['possible_root_causes']:
-                                st.markdown(f"- {cause}")
-
-                        if rep_error.get('recommended_actions'):
-                            st.markdown("### 💡 Recommended Actions")
-                            for action in rep_error['recommended_actions']:
-                                st.success(f"✓ {action}")
+            if len(unknown_candidates) > MAX_LLM_CANDIDATES:
+                for orig_idx, log in unknown_candidates:
+                    all_suspicious.append(orig_idx)
             else:
-                # Compact view
-                for group in filtered_groups:
-                    rep_error = group['representative_error']
-                    severity = rep_error.get('severity', 'INFO')
-                    color = get_severity_color(severity)
-                    
-                    compact_html = f"""
-                    <div class="compact-error-item" style="border-left-color: {color};">
-                        <span style="color: {color}; font-weight: bold;">{severity}</span>
-                        <span style="margin: 0 8px;">|</span>
-                        <span>{rep_error.get('exception_class', 'Unknown')}</span>
-                        <span style="margin: 0 8px;">|</span>
-                        <span>{rep_error.get('component', 'Unknown')}</span>
-                        <span style="margin: 0 8px;">|</span>
-                        <span style="color: #667eea;">{group['occurrences']}x</span>
-                    </div>
-                    """
-                    st.markdown(compact_html, unsafe_allow_html=True)
+                console.print(f"[cyan]Step 3: LLM confirmation on {len(unknown_candidates)} candidates...[/cyan]")
 
-        else:
-            # Individual errors view
-            if not filtered_errors:
-                st.markdown("""
-                <div class="empty-state">
-                    <div class="empty-state-emoji">🎉</div>
-                    <h3>No Errors Match Your Filters</h3>
-                    <p>Try adjusting your filter criteria</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            for i, error in enumerate(filtered_errors):
-                severity = error.get('severity', 'INFO')
-                quick_fix = error.get('recommended_actions', ['Investigate'])[0] if error.get('recommended_actions') else 'Investigate'
-                
-                with st.expander(
-                    f"{get_severity_emoji(severity)} **#{i+1}** - "
-                    f"{error.get('exception_class', 'Unknown')} | "
-                    f"{error.get('component', 'Unknown')} | {severity} | "
-                    f"Confidence: {error.get('confidence', 0)*100:.0f}%",
-                    expanded=(i < 3)
-                ):
-                    error_card_html = f"""
-                    <div class="error-card error-card-{severity.lower()}">
-                        <div class="error-preview">
-                            <div class="error-quick-fix">💡 Quick Fix: {quick_fix}</div>
-                        </div>
-                    </div>
-                    """
-                    st.markdown(error_card_html, unsafe_allow_html=True)
+                candidate_logs = [log for _, log in unknown_candidates]
+                candidate_indices = [idx for idx, _ in unknown_candidates]
 
-                    col_a, col_b = st.columns([2, 1])
+                chunks = []
+                for i in range(0, len(candidate_logs), CHUNK_SIZE):
+                    chunks.append(candidate_logs[i:i + CHUNK_SIZE])
 
-                    with col_a:
-                        st.markdown(f"### {get_category_icon(error.get('category', 'GENERIC'))} Error Details")
-                        st.write(f"**Exception:** {error.get('exception_class', 'Unknown')}")
-                        st.write(f"**Component:** {error.get('component', 'Unknown')}")
-                        st.write(f"**Category:** {error.get('category', 'GENERIC')}")
+                chunks_to_process = chunks[:MAX_LLM_CHUNKS]
 
-                        if error.get('severity_adjusted'):
-                            st.warning(f"⚡ Severity auto-adjusted from {error.get('original_severity')} to {severity}")
+                llm_offset = 0
+                for chunk_idx, chunk in enumerate(chunks_to_process):
+                    console.print(f"  [cyan]LLM chunk {chunk_idx + 1}/{len(chunks_to_process)}...[/cyan]", end=" ")
 
-                        if error.get('message'):
-                            st.markdown("**Message:**")
-                            highlighted_msg = highlight_search_text(error['message'], search_query)
-                            st.markdown(f'<div style="background: rgba(102, 126, 234, 0.1); padding: 12px; border-radius: 6px;">{highlighted_msg}</div>', unsafe_allow_html=True)
+                    prompt = self.create_fewshot_screening_prompt(chunk, llm_offset)
+                    result = self.safe_llm_call(
+                        prompt=prompt,
+                        system_msg="You are a log screener. Be SELECTIVE. Output ONLY valid JSON."
+                    )
 
-                    with col_b:
-                        st.markdown("### 📊 Metrics")
-                        st.metric("Severity", severity)
-                        st.metric("Confidence", f"{error.get('confidence', 0)*100:.0f}%")
-                        if error.get('stack_trace_depth'):
-                            st.metric("Stack Depth", f"{error['stack_trace_depth']} frames")
+                    if result and 'suspicious_indices' in result:
+                        for llm_idx in result['suspicious_indices']:
+                            real_pos = llm_offset + llm_idx
+                            if real_pos < len(candidate_indices):
+                                all_suspicious.append(candidate_indices[real_pos])
+                        console.print(f"[green]✓ found {len(result.get('suspicious_indices', []))}[/green]")
+                    else:
+                        for i in range(llm_offset, min(llm_offset + CHUNK_SIZE, len(candidate_indices))):
+                            all_suspicious.append(candidate_indices[i])
+                        console.print(f"[yellow]⚠ fallback[/yellow]")
 
-                    st.markdown("### 📍 Error Location & Context")
-                    render_context_viewer(error, search_query)
+                    llm_offset += len(chunk)
 
-                    if error.get('reasoning'):
-                        st.markdown("### 💭 Analysis Reasoning")
-                        st.warning(error['reasoning'])
+                    if chunk_idx < len(chunks_to_process) - 1:
+                        time.sleep(DELAY_BETWEEN_CALLS)
 
-                    if error.get('possible_root_causes'):
-                        st.markdown("### 🔍 Possible Root Causes")
-                        for cause in error['possible_root_causes']:
-                            st.markdown(f"- {cause}")
+        # STEP 4: Update Cache
+        if self.enable_cache and self.memory:
+            for i in all_suspicious:
+                if i < len(all_logs):
+                    self.memory.mark_critical(all_logs[i])
 
-                    if error.get('recommended_actions'):
-                        st.markdown("### 💡 Recommended Actions")
-                        for action in error['recommended_actions']:
-                            st.success(f"✓ {action}")
+            safe_sample_indices = [i for i in range(0, total_logs, max(1, total_logs // 5000))
+                                   if i not in set(all_suspicious)]
+            for i in safe_sample_indices[:5000]:
+                if i < len(all_logs):
+                    self.memory.mark_safe(all_logs[i])
 
-                    if error.get('needs_review'):
-                        st.warning("⚠️ Flagged for manual review (low confidence)")
+        # Deduplicate and sort
+        all_suspicious = sorted(list(set(all_suspicious)))
 
-    # ========================================================================
-    # TAB 3: RELATED ERRORS
-    # ========================================================================
+        # ====================================================================
+        # NEW: EXTRACT CONTEXT FOR EACH SUSPICIOUS LOG
+        # ====================================================================
+        console.print(f"[cyan]Step 4: Extracting context for {len(all_suspicious)} suspicious logs...[/cyan]")
 
-    with tab3:
-        st.header("🔗 Related Error Detection")
+        suspicious_with_context = self.context_extractor.extract_all_contexts(
+            all_logs, all_suspicious
+        )
 
-        suspicious_with_context = results.get('suspicious_with_context', [])
+        # Detect related error chains
+        error_chains = self.context_extractor.detect_related_errors(suspicious_with_context)
 
-        if suspicious_with_context:
-            from crysys_v3 import ContextExtractor
-            ctx_extractor = ContextExtractor()
-            chains = ctx_extractor.detect_related_errors(suspicious_with_context)
+        if error_chains:
+            console.print(f"[yellow]  ⚡ Detected {len(error_chains)} error chains (related errors)[/yellow]")
 
-            if chains:
-                st.markdown(f"""
-                <div class="timeline-card-warning">
-                    <h3>🔗 Found {len(chains)} Error Chain(s)</h3>
-                    <p>These errors likely caused each other (occurred within 5 seconds)</p>
-                </div>
-                """, unsafe_allow_html=True)
+        suspicious_pct = len(all_suspicious) / max(total_logs, 1) * 100
+        console.print(f"\n[bold green]✅ Screening: {len(all_suspicious):,}/{total_logs:,} suspicious ({suspicious_pct:.1f}%)[/bold green]")
 
-                for i, chain in enumerate(chains):
-                    with st.expander(f"🔗 Error Chain #{i+1} - {chain['count']} related errors", expanded=True):
-                        st.markdown(f"**Time window:** {chain.get('start_time', 'Unknown')} → {chain.get('end_time', 'Unknown')}")
-                        st.markdown(f"**Errors in chain:** {chain['count']}")
+        state['suspicious_indices'] = all_suspicious
+        state['suspicious_with_context'] = suspicious_with_context  # NEW
+        state['cache_hits'] = cache_hits
+        state['cache_misses'] = len(unknown_candidates)
+        state['screening_confidence'] = 0.9
+        state['current_stage'] = 'routing'
 
-                        for j, ctx_error in enumerate(chain['errors']):
-                            arrow = "🔴" if j == 0 else "↓ 🟠"
-                            highlighted_line = highlight_search_text(ctx_error['log_line'][:150], "")
-                            st.markdown(f"{arrow} **Line {ctx_error['line_number']}:** `{highlighted_line}`")
-                            if ctx_error.get('timestamp'):
-                                st.markdown(f"   ⏰ {ctx_error['timestamp']}")
-
-                        st.info(f"💡 **Tip:** The first error (Line {chain['errors'][0]['line_number']}) is likely the ROOT CAUSE! Fix it first.")
-            else:
-                st.markdown("""
-                <div class="empty-state">
-                    <div class="empty-state-emoji">✅</div>
-                    <h3>No Error Chains Detected</h3>
-                    <p>Errors appear to be independent</p>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("ℹ️ No context data available")
-
-    # ========================================================================
-    # TAB 4: COMPONENT HEALTH
-    # ========================================================================
-
-    with tab4:
-        render_component_health(results)
-
-    # ========================================================================
-    # TAB 5: ENHANCED VISUALIZATIONS
-    # ========================================================================
-
-    with tab5:
-        st.header("📊 Interactive Visualizations")
-
-        if results['error_events']:
-            viz_tab1, viz_tab2, viz_tab3, viz_tab4 = st.tabs([
-                "🥧 Severity", "📊 Categories", "🎯 Confidence", "🏷️ Components"
-            ])
-
-            with viz_tab1:
-                severity_counts = defaultdict(int)
-                for event in results['error_events']:
-                    severity_counts[event.get('severity', 'INFO')] += 1
-
-                fig = px.pie(
-                    values=list(severity_counts.values()),
-                    names=list(severity_counts.keys()),
-                    title="Error Severity Distribution (Click to filter)",
-                    color_discrete_map={
-                        'CRITICAL': '#f56565',
-                        'HIGH': '#ed8936',
-                        'MEDIUM': '#ecc94b',
-                        'LOW': '#48bb78',
-                        'INFO': '#4299e1'
-                    },
-                    hole=0.3
-                )
-                fig.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig, use_container_width=True)
-
-            with viz_tab2:
-                category_counts = defaultdict(int)
-                for event in results['error_events']:
-                    category_counts[event.get('category', 'GENERIC')] += 1
-
-                fig = px.bar(
-                    x=list(category_counts.keys()),
-                    y=list(category_counts.values()),
-                    title="Errors by Category",
-                    color=list(category_counts.values()),
-                    color_continuous_scale='Purples',
-                    text=list(category_counts.values())
-                )
-                fig.update_traces(texttemplate='%{text}', textposition='outside')
-                st.plotly_chart(fig, use_container_width=True)
-
-            with viz_tab3:
-                confidences = [e.get('confidence', 0) * 100 for e in results['error_events']]
-                fig = px.histogram(
-                    confidences,
-                    nbins=20,
-                    title="Confidence Score Distribution",
-                    color_discrete_sequence=['#667eea'],
-                    labels={'value': 'Confidence (%)', 'count': 'Errors'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with viz_tab4:
-                component_counts = defaultdict(int)
-                for event in results['error_events']:
-                    component_counts[event.get('component', 'Unknown')] += 1
-
-                fig = px.bar(
-                    x=list(component_counts.values()),
-                    y=list(component_counts.keys()),
-                    orientation='h',
-                    title="Errors by Component",
-                    color=list(component_counts.values()),
-                    color_continuous_scale='Reds',
-                    text=list(component_counts.values())
-                )
-                fig.update_traces(texttemplate='%{text}', textposition='outside')
-                st.plotly_chart(fig, use_container_width=True)
-
-        else:
-            st.markdown("""
-            <div class="empty-state">
-                <div class="empty-state-emoji">📊</div>
-                <h3>No Data to Visualize</h3>
-                <p>No errors found in the analysis</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # ========================================================================
-    # TAB 6: RECOMMENDATIONS
-    # ========================================================================
-
-    with tab6:
-        st.header("💡 Automated Recommendations")
-
-        if results.get('recommendations'):
-            for i, rec in enumerate(results['recommendations'], 1):
-                st.success(f"**{i}.** {rec}")
-
-        st.markdown("---")
-        st.subheader("🔧 Priority Action Items")
-
-        action_items = []
-        severity_errors = defaultdict(list)
-        for error in results['error_events']:
-            severity_errors[error.get('severity', 'INFO')].append(error)
-
-        if severity_errors.get('CRITICAL'):
-            for error in severity_errors['CRITICAL']:
-                action_items.append({
-                    'Priority': '🔴 P0 - Immediate',
-                    'Component': error.get('component', 'Unknown'),
-                    'Action': error.get('recommended_actions', ['Investigate immediately'])[0]
-                    if error.get('recommended_actions') else 'Investigate immediately',
-                    'Issue': error.get('exception_class', 'Critical Error')
-                })
-
-        if severity_errors.get('HIGH'):
-            for error in severity_errors['HIGH'][:3]:
-                action_items.append({
-                    'Priority': '🟠 P1 - Urgent',
-                    'Component': error.get('component', 'Unknown'),
-                    'Action': error.get('recommended_actions', ['Fix soon'])[0]
-                    if error.get('recommended_actions') else 'Fix soon',
-                    'Issue': error.get('exception_class', 'High Priority Error')
-                })
-
-        if action_items:
-            df_actions = pd.DataFrame(action_items)
-            st.dataframe(df_actions, use_container_width=True, hide_index=True)
-        else:
-            st.markdown("""
-            <div class="empty-state">
-                <div class="empty-state-emoji">🎉</div>
-                <h3>No High-Priority Action Items</h3>
-                <p>All errors are low priority</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("---")
-        st.subheader("⚡ Performance Metrics")
-
-        perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
-        with perf_col1:
-            st.info(f"**Processing Time**\n\n{results.get('processing_time', 0):.2f}s")
-        with perf_col2:
-            st.info(f"**Tokens Used**\n\n{results.get('tokens_used', 0):,}")
-        with perf_col3:
-            st.info(f"**Analysis Route**\n\n{results.get('route_taken', 'unknown').title()}")
-        with perf_col4:
-            speed = results['total_logs'] / max(results.get('processing_time', 1), 1)
-            st.info(f"**Speed**\n\n{speed:.0f} logs/sec")
-
-    # ========================================================================
-    # TAB 7: EXPORT
-    # ========================================================================
-
-    with tab7:
-        st.header("💾 Export Results")
-
-        export_col1, export_col2, export_col3 = st.columns(3)
-
-        with export_col1:
-            json_data = json.dumps(results, indent=2, default=str)
-            st.download_button(
-                label="📥 Full Results (JSON)",
-                data=json_data,
-                file_name=f"crysys_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
+        if self.dashboard:
+            self.dashboard.update(
+                processed_logs=total_logs,
+                suspicious_found=len(all_suspicious)
             )
 
-        with export_col2:
-            if results['error_events']:
-                flat_errors = []
-                for e in results['error_events']:
-                    flat_errors.append({
-                        'exception_class': e.get('exception_class', ''),
-                        'severity': e.get('severity', ''),
-                        'component': e.get('component', ''),
-                        'category': e.get('category', ''),
-                        'message': e.get('message', ''),
-                        'confidence': e.get('confidence', 0),
-                        'line_number': e.get('line_number', ''),
-                        'timestamp': e.get('timestamp', ''),
-                        'reasoning': e.get('reasoning', ''),
-                        'root_causes': ', '.join(e.get('possible_root_causes', [])),
-                        'actions': ', '.join(e.get('recommended_actions', []))
-                    })
-                df = pd.DataFrame(flat_errors)
-                csv_data = df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Errors Table (CSV)",
-                    data=csv_data,
-                    file_name=f"crysys_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+        return state
 
-        with export_col3:
-            try:
-                export_utils = ExportUtils()
-                excel_data = export_utils.create_excel_export(results)
-                st.download_button(
-                    label="📥 Full Report (Excel)",
-                    data=excel_data,
-                    file_name=f"crysys_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            except Exception as e:
-                st.warning(f"Excel export unavailable: {e}")
+    # ========================================================================
+    # CATEGORIZATION
+    # ========================================================================
 
-        st.markdown("---")
-        st.subheader("📋 JIRA Ticket Format")
+    def agent_categorize_errors(self, state: AnalysisState) -> AnalysisState:
+        """Categorize errors by type"""
+        suspicious_count = len(state['suspicious_indices'])
 
-        if results['error_events']:
-            critical_high = [e for e in results['error_events']
-                           if e.get('severity') in ['CRITICAL', 'HIGH']]
+        console.print(f"\n[bold cyan]🔀 Categorizing Errors[/bold cyan]")
 
-            if critical_high:
-                selected_error_idx = st.selectbox(
-                    "Select error to format for JIRA",
-                    range(len(critical_high)),
-                    format_func=lambda i: f"{critical_high[i].get('exception_class', 'Unknown')} - {critical_high[i].get('component', 'Unknown')}"
-                )
+        if suspicious_count == 0:
+            state['route_taken'] = 'skip'
+            state['current_stage'] = 'report'
+            return state
 
-                selected_error = critical_high[selected_error_idx]
-                export_utils = ExportUtils()
-                jira_text = export_utils.create_jira_format(selected_error)
+        suspicious_logs = [state['logs'][i] for i in state['suspicious_indices']
+                          if i < len(state['logs'])]
 
-                st.code(jira_text, language='markdown')
-                st.download_button(
-                    "📥 Download JIRA Format",
-                    data=jira_text,
-                    file_name="jira_ticket.md",
-                    mime="text/markdown"
-                )
+        db_errors = []
+        null_errors = []
+        network_errors = []
+        auth_errors = []
+        generic_errors = []
 
-            st.markdown("---")
-            st.subheader("💬 Slack Message Format")
+        for i, log in zip(state['suspicious_indices'], suspicious_logs):
+            log_lower = log.lower()
 
-            if critical_high:
-                slack_error = critical_high[0]
-                slack_text = export_utils.create_slack_format(slack_error)
-                st.code(slack_text, language='text')
-                st.download_button(
-                    "📥 Download Slack Format",
-                    data=slack_text,
-                    file_name="slack_message.txt",
-                    mime="text/plain"
-                )
+            # Database errors
+            if any(kw in log_lower for kw in ['database', 'jdbc', 'sql', 'connection pool', 'hibernate']):
+                db_errors.append(i)
+            # NullPointer errors  
+            elif any(kw in log_lower for kw in ['nullpointer', 'null pointer', 'npe']):
+                null_errors.append(i)
+            # Network errors (includes Apache connection issues)
+            elif any(kw in log_lower for kw in ['network', 'timeout', 'connection refused', 'socket', 
+                                                  'cannot create', 'factory error', 'unavailable']):
+                network_errors.append(i)
+            # Authentication errors (Linux/Apache auth failures)
+            elif any(kw in log_lower for kw in ['auth', 'login', 'permission', 'unauthorized', 
+                                                  'authentication failure', 'check pass', 'user unknown',
+                                                  'denied', 'forbidden', ' 401 ', ' 403 ']):
+                auth_errors.append(i)
+            # HTTP errors (Apache access logs)
+            elif any(kw in log_lower for kw in [' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ', 
+                                                  ' 400 ', ' 499 ']):
+                network_errors.append(i)  # Treat HTTP errors as network issues
+            else:
+                generic_errors.append(i)
+
+        state['db_errors'] = db_errors
+        state['null_errors'] = null_errors
+        state['network_errors'] = network_errors
+        state['auth_errors'] = auth_errors
+        state['generic_errors'] = generic_errors
+
+        console.print(f"  Database: {len(db_errors)}")
+        console.print(f"  NullPointer: {len(null_errors)}")
+        console.print(f"  Network: {len(network_errors)}")
+        console.print(f"  Authentication: {len(auth_errors)}")
+        console.print(f"  Generic: {len(generic_errors)}")
+
+        if suspicious_count <= 15:
+            state['route_taken'] = 'quick'
+            state['current_stage'] = 'quick_analysis'
+        else:
+            state['route_taken'] = 'specialized'
+            state['current_stage'] = 'specialized_analysis'
+
+        return state
+
+    def decide_analysis_route(self, state: AnalysisState) -> str:
+        route = state.get('route_taken', 'skip')
+        if route == 'skip':
+            return 'report'
+        elif route == 'quick':
+            return 'quick_analysis'
+        else:
+            return 'specialized_analysis'
+
+    # ========================================================================
+    # SPECIALIZED AGENTS - NOW WITH LINE NUMBER INFO
+    # ========================================================================
+
+    def _enrich_events_with_context(self, events: list[dict], category_indices: list[int], state: AnalysisState) -> list[dict]:
+        """
+        NEW: Enrich AI-analyzed events with line numbers and context
+        Maps each event back to its original log line
+        """
+        # Build lookup: index -> context
+        context_lookup = {}
+        for ctx in state.get('suspicious_with_context', []):
+            context_lookup[ctx['line_index']] = ctx
+
+        enriched = []
+        for i, event in enumerate(events):
+            # Try to match event to a log line
+            if i < len(category_indices):
+                orig_idx = category_indices[i]
+                if orig_idx in context_lookup:
+                    ctx = context_lookup[orig_idx]
+                    event['line_number'] = ctx['line_number']
+                    event['timestamp'] = ctx.get('timestamp', 'Unknown')
+                    event['log_line'] = ctx['log_line']
+                    event['before_context'] = ctx['before_context']
+                    event['after_context'] = ctx['after_context']
+                    event['context_start_line'] = ctx['context_start_line']
+                    event['context_end_line'] = ctx['context_end_line']
+
+            enriched.append(event)
+
+        return enriched
+
+    def analyze_database_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
+        """Database specialist with context enrichment"""
+        if not logs:
+            return []
+
+        prompt = f"""You are a DATABASE ERROR SPECIALIST analyzing database errors.
+
+LOGS TO ANALYZE:
+{chr(10).join(logs[:15])}
+
+For EACH error provide:
+- exception_class, severity (CRITICAL/HIGH/MEDIUM/LOW), confidence (0.0-1.0)
+- component, message, reasoning
+- stack_trace_depth, possible_root_causes, recommended_actions
+
+OUTPUT FORMAT:
+{{
+  "events": [
+    {{
+      "exception_class": "JDBCConnectionException",
+      "severity": "CRITICAL",
+      "confidence": 0.95,
+      "component": "HikariPool-1",
+      "message": "Connection timeout after 30000ms",
+      "reasoning": "Connection pool exhausted",
+      "stack_trace_depth": 10,
+      "possible_root_causes": ["Database server down", "Pool too small"],
+      "recommended_actions": ["Check database server", "Increase pool size"]
+    }}
+  ]
+}}
+
+Output ONLY valid JSON."""
+
+        result = self.safe_llm_call(prompt, "You are a database expert. Output ONLY valid JSON.")
+
+        if result and isinstance(result, dict) and 'events' in result:
+            events = result['events']
+        elif result and isinstance(result, list):
+            events = result
+        else:
+            events = []
+
+        # Enrich with context
+        events = self._enrich_events_with_context(events, indices, state)
+
+        return events
+
+    def analyze_nullpointer_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
+        """NullPointer specialist with context enrichment"""
+        if not logs:
+            return []
+
+        prompt = f"""You are a NULL POINTER EXCEPTION SPECIALIST.
+
+LOGS TO ANALYZE:
+{chr(10).join(logs[:15])}
+
+For EACH error provide:
+- exception_class, severity, confidence, component, message, reasoning
+- stack_trace_depth, possible_root_causes, recommended_actions
+
+OUTPUT FORMAT:
+{{
+  "events": [
+    {{
+      "exception_class": "NullPointerException",
+      "severity": "HIGH",
+      "confidence": 0.88,
+      "component": "UserService",
+      "message": "Null user object at line 245",
+      "reasoning": "User object not initialized",
+      "stack_trace_depth": 8,
+      "possible_root_causes": ["User not found in database"],
+      "recommended_actions": ["Add null check before user access"]
+    }}
+  ]
+}}
+
+Output ONLY valid JSON."""
+
+        result = self.safe_llm_call(prompt, "You are a null safety expert. Output ONLY valid JSON.")
+
+        if result and isinstance(result, dict) and 'events' in result:
+            events = result['events']
+        elif result and isinstance(result, list):
+            events = result
+        else:
+            events = []
+
+        events = self._enrich_events_with_context(events, indices, state)
+        return events
+
+    def analyze_network_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
+        """Network specialist with context enrichment"""
+        if not logs:
+            return []
+
+        prompt = f"""You are a NETWORK ERROR SPECIALIST.
+
+LOGS TO ANALYZE:
+{chr(10).join(logs[:15])}
+
+For EACH error provide:
+- exception_class, severity, confidence, component, message, reasoning
+- stack_trace_depth, possible_root_causes, recommended_actions
+
+OUTPUT FORMAT:
+{{
+  "events": [
+    {{
+      "exception_class": "SocketTimeoutException",
+      "severity": "HIGH",
+      "confidence": 0.92,
+      "component": "NetworkClient",
+      "message": "Connection timeout after 30s",
+      "reasoning": "Remote service not responding",
+      "stack_trace_depth": 6,
+      "possible_root_causes": ["Remote service down"],
+      "recommended_actions": ["Check remote service"]
+    }}
+  ]
+}}
+
+Output ONLY valid JSON."""
+
+        result = self.safe_llm_call(prompt, "You are a network expert. Output ONLY valid JSON.")
+
+        if result and isinstance(result, dict) and 'events' in result:
+            events = result['events']
+        elif result and isinstance(result, list):
+            events = result
+        else:
+            events = []
+
+        events = self._enrich_events_with_context(events, indices, state)
+        return events
+
+    def analyze_authentication_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
+        """Authentication specialist with context enrichment - handles Linux syslog, Apache, Liferay auth"""
+        if not logs:
+            return []
+
+        prompt = f"""You are an AUTHENTICATION ERROR SPECIALIST analyzing authentication/authorization failures.
+
+This includes:
+- Linux syslog authentication failures (pam_unix, sshd)
+- Apache/web server authentication issues
+- Application-level auth errors
+- HTTP 401/403 errors
+
+LOGS TO ANALYZE:
+{chr(10).join(logs[:15])}
+
+For EACH error provide:
+- exception_class (e.g., "AuthenticationFailure", "SSHAuthFailure", "HTTP403")
+- severity (CRITICAL if many attempts, HIGH for single failures, MEDIUM for expected failures)
+- confidence (0.0-1.0)
+- component (e.g., "sshd", "Apache", "AuthService")
+- message (brief description)
+- reasoning (why this is an auth issue)
+- stack_trace_depth (usually 0 for system logs)
+- possible_root_causes (e.g., "Brute force attack", "Invalid credentials", "Expired session")
+- recommended_actions (e.g., "Block IP", "Reset password", "Check firewall")
+
+IMPORTANT:
+- Multiple auth failures from same IP = likely brute force attack (CRITICAL)
+- "user unknown" = reconnaissance attempt (HIGH)
+- Single failure = normal failed login (MEDIUM)
+
+OUTPUT FORMAT:
+{{
+  "events": [
+    {{
+      "exception_class": "SSHAuthenticationFailure",
+      "severity": "HIGH",
+      "confidence": 0.95,
+      "component": "sshd",
+      "message": "Failed SSH login attempt from 218.188.2.4",
+      "reasoning": "Multiple authentication failures indicate brute force attempt",
+      "stack_trace_depth": 0,
+      "possible_root_causes": ["Brute force attack", "Invalid credentials"],
+      "recommended_actions": ["Block IP 218.188.2.4", "Enable fail2ban", "Review SSH config"]
+    }}
+  ]
+}}
+
+Output ONLY valid JSON."""
+
+        result = self.safe_llm_call(prompt, "You are an authentication security expert. Output ONLY valid JSON.")
+
+        if result and isinstance(result, dict) and 'events' in result:
+            events = result['events']
+        elif result and isinstance(result, list):
+            events = result
+        else:
+            events = []
+
+        events = self._enrich_events_with_context(events, indices, state)
+        return events
+        """Generic analyst with context enrichment"""
+        if not logs:
+            return []
+
+        prompt = f"""You are analyzing ERROR LOGS.
+
+LOGS TO ANALYZE:
+{chr(10).join(logs[:15])}
+
+For EACH error provide:
+- exception_class, severity, confidence, component, message, reasoning
+- stack_trace_depth, possible_root_causes, recommended_actions
+
+OUTPUT FORMAT:
+{{
+  "events": [
+    {{
+      "exception_class": "RuntimeException",
+      "severity": "HIGH",
+      "confidence": 0.85,
+      "component": "ServiceName",
+      "message": "Brief error description",
+      "reasoning": "Why this error occurred",
+      "stack_trace_depth": 10,
+      "possible_root_causes": ["Cause 1", "Cause 2"],
+      "recommended_actions": ["Action 1", "Action 2"]
+    }}
+  ]
+}}
+
+Output ONLY valid JSON."""
+
+        result = self.safe_llm_call(prompt, "You are an error analyst. Output ONLY valid JSON.")
+
+        if result and isinstance(result, dict) and 'events' in result:
+            events = result['events']
+        elif result and isinstance(result, list):
+            events = result
+        else:
+            events = []
+
+        events = self._enrich_events_with_context(events, indices, state)
+        return events
+
+    # ========================================================================
+    # QUICK ANALYSIS
+    # ========================================================================
+
+    def agent_quick_analysis(self, state: AnalysisState) -> AnalysisState:
+        """Quick analysis for few errors with context"""
+        console.print("\n[bold yellow]🔬 Quick Analysis[/bold yellow]")
+
+        if self.dashboard:
+            self.dashboard.update(current_stage="Quick Analysis")
+
+        suspicious_logs = [state['logs'][i] for i in state['suspicious_indices']]
+        all_indices = state['suspicious_indices']
+
+        prompt = f"""Analyze these {len(suspicious_logs)} errors:
+
+{chr(10).join(suspicious_logs)}
+
+For each error provide:
+- exception_class, severity (CRITICAL/HIGH/MEDIUM/LOW), confidence (0.0-1.0)
+- component, message, reasoning
+- possible_root_causes, recommended_actions
+
+Return JSON: {{"events": [...]}}"""
+
+        result = self.safe_llm_call(prompt, "You are an error analyst. Output ONLY JSON.")
+
+        if result and 'events' in result:
+            events = result['events']
+            events = self._enrich_events_with_context(events, all_indices, state)
+        else:
+            events = []
+
+        state['error_events'] = events
+        state['tokens_used'] = self.total_tokens_used
+        state['current_stage'] = 'confidence_filter'
+
+        console.print(f"[green]✓ Found {len(events)} events[/green]")
+        return state
+
+    # ========================================================================
+    # SPECIALIZED ANALYSIS - NOW PASSES INDICES AND STATE
+    # ========================================================================
+
+    def agent_specialized_analysis(self, state: AnalysisState) -> AnalysisState:
+        """Specialized analysis with context enrichment"""
+        console.print("\n[bold cyan]🔬 Specialized Analysis[/bold cyan]")
+
+        if self.dashboard:
+            self.dashboard.update(current_stage="Specialized Analysis")
+
+        all_events = []
+
+        # Database specialist
+        if state['db_errors']:
+            console.print(f"\n[cyan]→ Database specialist analyzing {len(state['db_errors'])} errors...[/cyan]")
+            db_logs = [state['logs'][i] for i in state['db_errors'] if i < len(state['logs'])]
+            if db_logs:
+                db_events = self.analyze_database_errors(db_logs, state['db_errors'], state)
+                for event in db_events:
+                    event['category'] = 'DATABASE'
+                all_events.extend(db_events)
+                console.print(f"  [green]✓ Database: {len(db_events)} events[/green]")
+
+        # NullPointer specialist
+        if state['null_errors']:
+            console.print(f"\n[cyan]→ NullPointer specialist analyzing {len(state['null_errors'])} errors...[/cyan]")
+            null_logs = [state['logs'][i] for i in state['null_errors'] if i < len(state['logs'])]
+            if null_logs:
+                null_events = self.analyze_nullpointer_errors(null_logs, state['null_errors'], state)
+                for event in null_events:
+                    event['category'] = 'NULL_POINTER'
+                all_events.extend(null_events)
+                console.print(f"  [green]✓ NullPointer: {len(null_events)} events[/green]")
+
+        # Network specialist
+        if state['network_errors']:
+            console.print(f"\n[cyan]→ Network specialist analyzing {len(state['network_errors'])} errors...[/cyan]")
+            net_logs = [state['logs'][i] for i in state['network_errors'] if i < len(state['logs'])]
+            if net_logs:
+                net_events = self.analyze_network_errors(net_logs, state['network_errors'], state)
+                for event in net_events:
+                    event['category'] = 'NETWORK'
+                all_events.extend(net_events)
+                console.print(f"  [green]✓ Network: {len(net_events)} events[/green]")
+
+        # Authentication specialist (NEW!)
+        if state['auth_errors']:
+            console.print(f"\n[cyan]→ Authentication specialist analyzing {len(state['auth_errors'])} errors...[/cyan]")
+            auth_logs = [state['logs'][i] for i in state['auth_errors'] if i < len(state['logs'])]
+            if auth_logs:
+                auth_events = self.analyze_authentication_errors(auth_logs, state['auth_errors'], state)
+                for event in auth_events:
+                    event['category'] = 'AUTHENTICATION'
+                all_events.extend(auth_events)
+                console.print(f"  [green]✓ Authentication: {len(auth_events)} events[/green]")
+
+        # Generic errors
+        if state['generic_errors']:
+            console.print(f"\n[cyan]→ Generic analyst analyzing {len(state['generic_errors'])} errors...[/cyan]")
+            other_logs = [state['logs'][i] for i in state['generic_errors'] if i < len(state['logs'])]
+            if other_logs:
+                other_events = self.analyze_generic_errors(other_logs, state['generic_errors'], state)
+                for event in other_events:
+                    event['category'] = 'GENERIC'
+                all_events.extend(other_events)
+                console.print(f"  [green]✓ Generic: {len(other_events)} events[/green]")
+
+        state['error_events'] = all_events
+        state['tokens_used'] = self.total_tokens_used
+        state['current_stage'] = 'confidence_filter'
+
+        console.print(f"\n[bold green]✅ Total events: {len(all_events)}[/bold green]")
+
+        if self.dashboard:
+            self.dashboard.update(errors_analyzed=len(all_events))
+
+        return state
+
+    # ========================================================================
+    # CONFIDENCE FILTERING
+    # ========================================================================
+
+    def agent_confidence_filter(self, state: AnalysisState) -> AnalysisState:
+        """Separate high-confidence from low-confidence events"""
+        console.print("\n[bold magenta]📊 Confidence Filtering[/bold magenta]")
+
+        if self.dashboard:
+            self.dashboard.update(current_stage="Confidence Filtering")
+
+        high_confidence = []
+        low_confidence = []
+
+        for event in state['error_events']:
+            confidence = event.get('confidence', 0.5)
+            if confidence >= 0.7:
+                high_confidence.append(event)
+            else:
+                low_confidence.append(event)
+                event['needs_review'] = True
+
+        state['high_confidence_events'] = high_confidence
+        state['low_confidence_events'] = low_confidence
+        state['current_stage'] = 'report'
+
+        console.print(f"[green]✓ High confidence: {len(high_confidence)}[/green]")
+        console.print(f"[yellow]⚠ Low confidence (needs review): {len(low_confidence)}[/yellow]")
+
+        return state
+
+    # ========================================================================
+    # REPORT GENERATION
+    # ========================================================================
+
+    def agent_generate_report(self, state: AnalysisState) -> AnalysisState:
+        """Generate final report"""
+        console.print("\n[bold green]📋 Generating Report[/bold green]")
+
+        if self.dashboard:
+            self.dashboard.update(current_stage="Generating Report")
+
+        if state['route_taken'] == 'skip':
+            state['final_summary'] = "No errors detected. All systems operating normally."
+            state['recommendations'] = ["Continue monitoring"]
+            state['highest_severity'] = "INFO"
+            state['requires_immediate_attention'] = False
+        else:
+            events = state['error_events']
+            critical = sum(1 for e in events if e.get('severity') == 'CRITICAL')
+            high = sum(1 for e in events if e.get('severity') == 'HIGH')
+
+            if critical > 0:
+                state['highest_severity'] = 'CRITICAL'
+                state['requires_immediate_attention'] = True
+            elif high > 3:
+                state['highest_severity'] = 'HIGH'
+                state['requires_immediate_attention'] = True
+            else:
+                state['highest_severity'] = 'MEDIUM'
+                state['requires_immediate_attention'] = False
+
+            cache_efficiency = (state['cache_hits'] / max(state['total_logs'], 1)) * 100 if state.get('cache_hits', 0) > 0 else 0
+            state['final_summary'] = f"Analyzed {state['total_logs']} logs "
+            if cache_efficiency > 0:
+                state['final_summary'] += f"({cache_efficiency:.0f}% from cache) "
+            state['final_summary'] += f"and found {len(state['suspicious_indices'])} suspicious ({len(events)} confirmed errors). "
+
+            if critical > 0:
+                state['final_summary'] += f"{critical} CRITICAL errors require immediate attention."
+
+            state['recommendations'] = []
+            if len(state['low_confidence_events']) > 0:
+                state['recommendations'].append(f"Review {len(state['low_confidence_events'])} low-confidence events manually")
+            if state['db_errors']:
+                state['recommendations'].append("Investigate database connection pool configuration")
+            if state['null_errors']:
+                state['recommendations'].append("Add null safety checks in affected components")
+            if state['network_errors']:
+                state['recommendations'].append("Check network connectivity and timeouts")
+            if not state['recommendations']:
+                state['recommendations'] = ["Monitor for recurring patterns", "Review error logs"]
+
+        state['current_stage'] = 'complete'
+        state['tokens_used'] = self.total_tokens_used
+
+        if self.enable_cache and self.memory:
+            self.memory.save_cache()
+            console.print("[green]✓ Cache saved for next run[/green]")
+
+        return state
+
+    # ========================================================================
+    # BUILD GRAPH
+    # ========================================================================
+
+    def build_graph(self):
+        """Build workflow"""
+        workflow = StateGraph(AnalysisState)
+
+        workflow.add_node("screening", self.agent_screen_logs)
+        workflow.add_node("categorize", self.agent_categorize_errors)
+        workflow.add_node("quick_analysis", self.agent_quick_analysis)
+        workflow.add_node("specialized_analysis", self.agent_specialized_analysis)
+        workflow.add_node("confidence_filter", self.agent_confidence_filter)
+        workflow.add_node("report", self.agent_generate_report)
+
+        workflow.set_entry_point("screening")
+        workflow.add_edge("screening", "categorize")
+
+        workflow.add_conditional_edges(
+            "categorize",
+            self.decide_analysis_route,
+            {
+                'report': 'report',
+                'quick_analysis': 'quick_analysis',
+                'specialized_analysis': 'specialized_analysis'
+            }
+        )
+
+        workflow.add_edge("quick_analysis", "confidence_filter")
+        workflow.add_edge("specialized_analysis", "confidence_filter")
+        workflow.add_edge("confidence_filter", "report")
+        workflow.add_edge("report", END)
+
+        return workflow.compile()
+
+    # ========================================================================
+    # MAIN ANALYSIS
+    # ========================================================================
+
+    def analyze_logs(self, logs: list[str]) -> dict:
+        """Run complete analysis"""
+        if self.dashboard:
+            self.dashboard.update(total_logs=len(logs), current_stage="Starting")
+
+        console.print(Panel.fit(
+            f"[bold yellow]🚀 CRYSYS v3.0[/bold yellow]\n"
+            f"Analyzing {len(logs)} logs",
+            border_style="yellow"
+        ))
+
+        app = self.build_graph()
+
+        initial_state = {
+            'logs': logs,
+            'total_logs': len(logs),
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'suspicious_indices': [],
+            'suspicious_with_context': [],  # NEW
+            'screening_confidence': 0.0,
+            'db_errors': [],
+            'null_errors': [],
+            'network_errors': [],
+            'auth_errors': [],
+            'generic_errors': [],
+            'error_events': [],
+            'high_confidence_events': [],
+            'low_confidence_events': [],
+            'final_summary': '',
+            'recommendations': [],
+            'highest_severity': 'INFO',
+            'requires_immediate_attention': False,
+            'tokens_used': 0,
+            'processing_time': 0.0,
+            'route_taken': '',
+            'current_stage': 'screening'
+        }
+
+        start_time = time.time()
+
+        if self.enable_dashboard and self.dashboard:
+            with Live(self.dashboard.get_table(), refresh_per_second=4, console=console):
+                final_state = app.invoke(initial_state)
+        else:
+            final_state = app.invoke(initial_state)
+
+        elapsed = time.time() - start_time
+        final_state['processing_time'] = elapsed
+
+        console.print(f"\n[bold green]✅ Analysis Complete in {elapsed:.1f}s[/bold green]")
+
+        return final_state
+
 
 # ============================================================================
-# FOOTER
+# MAIN
 # ============================================================================
 
-st.markdown("---")
-st.markdown(
-    "<p style='text-align: center; color: #a0aec0;'>"
-    "🔥 Powered by CRYSYS v3.0 Enhanced Edition | "
-    "Built with LangGraph + Groq LLaMA 3.3 70B + Streamlit | "
-    "All Visual Enhancements Implemented ✨"
-    "</p>",
-    unsafe_allow_html=True
-)
+def main():
+    import sys
+
+    if '--clear-cache' in sys.argv or '--reset' in sys.argv:
+        cache_file = Path("crysys_cache.pkl")
+        if cache_file.exists():
+            cache_file.unlink()
+            console.print("[bold green]✓ Cache cleared![/bold green]")
+        return
+
+    GROQ_API_KEY = "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"
+
+    sample_logs = [
+        "2026-01-20 10:15:32 ERROR [BlogsEntryService] java.lang.NullPointerException at line 245",
+        "2026-01-20 10:15:33 ERROR [DatabasePool] org.hibernate.exception.JDBCConnectionException: Cannot connect to database",
+        "2026-01-20 10:15:34 INFO [SystemService] Application started successfully",
+        "2026-01-20 10:15:35 ERROR [UserService] java.lang.NullPointerException at UserServiceImpl.getUserById",
+        "2026-01-20 10:15:36 DEBUG [CacheManager] Cache hit for key user_12345",
+        "2026-01-20 10:15:37 INFO [HealthCheck] System health check passed",
+        "2026-01-20 10:15:38 ERROR [AuthService] Failed login attempt for user admin from IP 192.168.1.100",
+        "2026-01-20 10:15:39 ERROR [NetworkClient] java.net.SocketTimeoutException: Connection timeout after 30s",
+        "2026-01-20 10:15:40 ERROR [DatabasePool] Connection pool exhausted, max 100 connections",
+        "2026-01-20 10:15:41 INFO [APIController] Request processed successfully in 45ms",
+    ] * 20
+
+    try:
+        with open("logs/liferay.log", 'r', encoding='utf-8') as f:
+            real_logs = [line.strip() for line in f.readlines() if line.strip()]
+            if real_logs:
+                sample_logs = real_logs
+    except:
+        console.print("[yellow]⚠ Using sample logs[/yellow]")
+
+    analyzer = UltimateCRYSYS(
+        api_key=GROQ_API_KEY,
+        enable_parallel=True,
+        enable_cache=True,
+        enable_dashboard=True,
+        context_window=5
+    )
+
+    results = analyzer.analyze_logs(sample_logs)
+
+    console.print(f"\n[bold green]Analysis Complete![/bold green]")
+    console.print(f"Total errors: {len(results['error_events'])}")
+    console.print(f"Processing time: {results['processing_time']:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
