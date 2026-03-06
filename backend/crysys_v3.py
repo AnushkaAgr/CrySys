@@ -466,12 +466,25 @@ class UltimateCRYSYS:
 
     def keyword_screen(self, logs: list[str], offset: int = 0) -> list[int]:
         suspicious = []
-        keywords = ['error', 'exception', 'failed', 'fatal', 'critical', 'null', 'timeout']
+        keywords = ['error', 'exception', 'failed', 'fatal', 'critical', 'null', 'timeout', 
+                    'authentication failure', 'refused', 'abnormally']
+        
+        # HTTP error codes (with quotes/spaces to match access logs)
+        http_errors = [' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ', ' 400 ', ' 499 ',
+                      '" 404 ', '" 500 ', '" 502 ', '" 503 ', '" 504 ']
 
         for i, log in enumerate(logs):
             log_lower = log.lower()
-            if any(kw in log_lower for kw in keywords):
-                if not any(level in log_lower for level in ['info:', 'debug:', 'trace:']):
+            
+            # Check keywords
+            has_keyword = any(kw in log_lower for kw in keywords)
+            
+            # Check HTTP error codes
+            has_http_error = any(code in log for code in http_errors)
+            
+            if has_keyword or has_http_error:
+                # Skip if it's just info/debug
+                if not any(level in log_lower for level in ['info:', 'debug:', 'trace:', '[notice]', 'resuming normal']):
                     suspicious.append(i + offset)
 
         return suspicious
@@ -537,11 +550,15 @@ Be SELECTIVE - most logs are normal!"""
             'nullpointer', 'stacktrace', 'caused by',
             # Apache/Linux specific
             'authentication failure', 'connection refused', 
-            'cannot create', 'abnormally', 'denied',
-            # HTTP error codes
-            ' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ',
+            'cannot create', 'abnormally', 'denied', 'user unknown',
             # System errors
-            'segfault', 'core dumped', 'panic'
+            'segfault', 'core dumped', 'panic', 'exited abnormally'
+        ]
+        
+        # HTTP error codes for Apache access logs (format: " 404 " or '" 404')
+        http_error_patterns = [
+            '" 404 ', '" 500 ', '" 502 ', '" 503 ', '" 504 ', '" 400 ',
+            ' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ', ' 400 '
         ]
         
         safe_indicators = [
@@ -551,18 +568,31 @@ Be SELECTIVE - most logs are normal!"""
             # Successful operations
             'success', 'ok /etc', 'resuming normal', 'configured',
             'session opened', 'session closed',
-            # HTTP success codes
-            ' 200 ', ' 201 ', ' 204 ', ' 301 ', ' 302 '
+            # HTTP success codes (with and without quotes)
+            ' 200 ', ' 201 ', ' 204 ', ' 301 ', ' 302 ',
+            '" 200 ', '" 201 ', '" 204 ', '" 301 ', '" 302 ', '" 304 '
         ]
 
         keyword_candidates = []
 
         for i, log in enumerate(all_logs):
             log_lower = log.lower()
-            if any(safe in log_lower for safe in safe_indicators):
-                if not any(kw in log_lower for kw in error_keywords):
-                    continue
-            if any(kw in log_lower for kw in error_keywords):
+            
+            # Check if it's a safe log first
+            is_safe = any(safe in log_lower for safe in safe_indicators)
+            
+            # Check for error keywords
+            has_error_keyword = any(kw in log_lower for kw in error_keywords)
+            
+            # Check for HTTP error codes (case-sensitive)
+            has_http_error = any(pattern in log for pattern in http_error_patterns)
+            
+            # Skip safe logs unless they have error keywords
+            if is_safe and not has_error_keyword and not has_http_error:
+                continue
+                
+            # Add to candidates if has errors
+            if has_error_keyword or has_http_error:
                 keyword_candidates.append((i, log))
 
         console.print(f"[green]  ✓ Pre-filter: {total_logs:,} → {len(keyword_candidates):,} candidates[/green]")
@@ -726,19 +756,20 @@ Be SELECTIVE - most logs are normal!"""
             # NullPointer errors  
             elif any(kw in log_lower for kw in ['nullpointer', 'null pointer', 'npe']):
                 null_errors.append(i)
+            # Authentication errors (Linux/Apache auth failures) - check BEFORE network
+            elif any(kw in log_lower for kw in ['authentication failure', 'check pass', 'user unknown']):
+                auth_errors.append(i)
+            # HTTP errors (Apache access logs) - check with quotes
+            elif any(pattern in log for pattern in ['" 404 ', '" 500 ', '" 502 ', '" 503 ', '" 504 ', '" 400 ']):
+                network_errors.append(i)
             # Network errors (includes Apache connection issues)
             elif any(kw in log_lower for kw in ['network', 'timeout', 'connection refused', 'socket', 
                                                   'cannot create', 'factory error', 'unavailable']):
                 network_errors.append(i)
-            # Authentication errors (Linux/Apache auth failures)
+            # Other auth patterns
             elif any(kw in log_lower for kw in ['auth', 'login', 'permission', 'unauthorized', 
-                                                  'authentication failure', 'check pass', 'user unknown',
                                                   'denied', 'forbidden', ' 401 ', ' 403 ']):
                 auth_errors.append(i)
-            # HTTP errors (Apache access logs)
-            elif any(kw in log_lower for kw in [' 404 ', ' 500 ', ' 502 ', ' 503 ', ' 504 ', 
-                                                  ' 400 ', ' 499 ']):
-                network_errors.append(i)  # Treat HTTP errors as network issues
             else:
                 generic_errors.append(i)
 
@@ -938,116 +969,233 @@ Output ONLY valid JSON."""
         elif result and isinstance(result, list):
             events = result
         else:
+            # FALLBACK: Create basic events for HTTP errors
+            console.print(f"[yellow]  ⚠ Network LLM empty, creating {len(logs)} basic HTTP error events...[/yellow]")
             events = []
+            for log in logs[:50]:  # Limit to first 50 to avoid huge processing
+                # Skip HTTP success codes
+                if any(code in log for code in ['" 200 ', '" 201 ', '" 204 ', '" 301 ', '" 302 ']):
+                    continue
+                
+                # Detect error type
+                if '" 404 ' in log or ' 404 ' in log:
+                    exception = "HTTP404NotFound"
+                    severity = "MEDIUM"
+                elif any(code in log for code in ['" 500 ', '" 502 ', '" 503 ', '" 504 ']):
+                    exception = "HTTPServerError"
+                    severity = "HIGH"
+                else:
+                    exception = "NetworkError"
+                    severity = "MEDIUM"
+                
+                events.append({
+                    "exception_class": exception,
+                    "severity": severity,
+                    "confidence": 0.8,
+                    "component": "ApacheServer",
+                    "message": log[:150],
+                    "reasoning": "HTTP error detected in access logs",
+                    "stack_trace_depth": 0,
+                    "possible_root_causes": ["Client request error" if "404" in exception else "Server error"],
+                    "recommended_actions": ["Check server logs" if "Server" in exception else "Verify URL exists"]
+                })
 
         events = self._enrich_events_with_context(events, indices, state)
         return events
 
     def analyze_authentication_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
-        """Authentication specialist with context enrichment - handles Linux syslog, Apache, Liferay auth"""
+        """Authentication specialist - handles Linux syslog, Apache, Liferay auth"""
         if not logs:
             return []
 
-        prompt = f"""You are an AUTHENTICATION ERROR SPECIALIST analyzing authentication/authorization failures.
+        # Group similar auth failures to reduce API calls
+        all_events = []
+        batch_size = 20
+        
+        for i in range(0, len(logs), batch_size):
+            batch = logs[i:i+batch_size]
+            batch_indices = indices[i:i+batch_size]
+            
+            prompt = f"""Analyze these authentication/login failures. These are REAL ERRORS.
 
-This includes:
-- Linux syslog authentication failures (pam_unix, sshd)
-- Apache/web server authentication issues
-- Application-level auth errors
-- HTTP 401/403 errors
+LOGS ({len(batch)} entries):
+{chr(10).join(batch)}
 
-LOGS TO ANALYZE:
-{chr(10).join(logs[:15])}
+IMPORTANT: 
+- "authentication failure" = REAL ERROR (not info/notice)
+- "check pass; user unknown" = REAL ERROR (invalid user attempt)
+- Multiple failures from same IP = brute force attack
+- Return ALL errors you see, don't skip any
 
-For EACH error provide:
-- exception_class (e.g., "AuthenticationFailure", "SSHAuthFailure", "HTTP403")
-- severity (CRITICAL if many attempts, HIGH for single failures, MEDIUM for expected failures)
-- confidence (0.0-1.0)
-- component (e.g., "sshd", "Apache", "AuthService")
-- message (brief description)
-- reasoning (why this is an auth issue)
-- stack_trace_depth (usually 0 for system logs)
-- possible_root_causes (e.g., "Brute force attack", "Invalid credentials", "Expired session")
-- recommended_actions (e.g., "Block IP", "Reset password", "Check firewall")
-
-IMPORTANT:
-- Multiple auth failures from same IP = likely brute force attack (CRITICAL)
-- "user unknown" = reconnaissance attempt (HIGH)
-- Single failure = normal failed login (MEDIUM)
-
-OUTPUT FORMAT:
+For EACH authentication error, provide JSON:
 {{
   "events": [
     {{
       "exception_class": "SSHAuthenticationFailure",
       "severity": "HIGH",
-      "confidence": 0.95,
+      "confidence": 0.9,
       "component": "sshd",
-      "message": "Failed SSH login attempt from 218.188.2.4",
-      "reasoning": "Multiple authentication failures indicate brute force attempt",
+      "message": "SSH authentication failed from 218.188.2.4",
+      "reasoning": "Invalid login attempt",
       "stack_trace_depth": 0,
-      "possible_root_causes": ["Brute force attack", "Invalid credentials"],
-      "recommended_actions": ["Block IP 218.188.2.4", "Enable fail2ban", "Review SSH config"]
+      "possible_root_causes": ["Brute force", "Wrong password"],
+      "recommended_actions": ["Monitor IP", "Enable fail2ban"]
     }}
   ]
 }}
 
-Output ONLY valid JSON."""
+SEVERITY GUIDE:
+- CRITICAL: 10+ failures from same IP (brute force attack)
+- HIGH: "user unknown" or 3-9 failures (reconnaissance)
+- MEDIUM: Single authentication failure (normal failed login)
 
-        result = self.safe_llm_call(prompt, "You are an authentication security expert. Output ONLY valid JSON.")
+Output valid JSON with ALL errors."""
 
-        if result and isinstance(result, dict) and 'events' in result:
-            events = result['events']
-        elif result and isinstance(result, list):
-            events = result
-        else:
-            events = []
+            result = self.safe_llm_call(prompt, "Analyze authentication errors. Output ONLY valid JSON.")
 
-        events = self._enrich_events_with_context(events, indices, state)
-        return events
-        """Generic analyst with context enrichment"""
+            if result and isinstance(result, dict) and 'events' in result:
+                events = result['events']
+            elif result and isinstance(result, list):
+                events = result
+            else:
+                # FALLBACK: If LLM fails, create basic events from the logs
+                console.print(f"[yellow]  ⚠ LLM returned empty, creating basic events...[/yellow]")
+                events = []
+                for log in batch:
+                    # Extract basic info
+                    component = "sshd" if "sshd" in log else "pam_unix" if "pam_unix" in log else "auth"
+                    ip_match = re.search(r'rhost=([^\s]+)', log)
+                    ip = ip_match.group(1) if ip_match else "unknown"
+                    
+                    events.append({
+                        "exception_class": "AuthenticationFailure",
+                        "severity": "HIGH",
+                        "confidence": 0.8,
+                        "component": component,
+                        "message": f"Authentication failure from {ip}",
+                        "reasoning": "Failed login attempt detected in system logs",
+                        "stack_trace_depth": 0,
+                        "possible_root_causes": ["Invalid credentials", "Brute force attempt"],
+                        "recommended_actions": ["Monitor this IP", "Review auth logs"]
+                    })
+            
+            # Enrich this batch
+            enriched = self._enrich_events_with_context(events, batch_indices, state)
+            all_events.extend(enriched)
+        
+        return all_events
+
+    def analyze_generic_errors(self, logs: list[str], indices: list[int], state: AnalysisState) -> list[dict]:
+        """Generic analyst - processes ALL logs in batches"""
         if not logs:
             return []
 
-        prompt = f"""You are analyzing ERROR LOGS.
+        all_events = []
+        batch_size = 20
+        
+        for i in range(0, len(logs), batch_size):
+            batch = logs[i:i+batch_size]
+            batch_indices = indices[i:i+batch_size]
 
-LOGS TO ANALYZE:
-{chr(10).join(logs[:15])}
+            prompt = f"""Analyze these error logs. Report ALL errors you see.
 
-For EACH error provide:
-- exception_class, severity, confidence, component, message, reasoning
-- stack_trace_depth, possible_root_causes, recommended_actions
+LOGS ({len(batch)} entries):
+{chr(10).join(batch)}
 
-OUTPUT FORMAT:
+For EACH error provide JSON:
 {{
   "events": [
     {{
-      "exception_class": "RuntimeException",
+      "exception_class": "ErrorType",
       "severity": "HIGH",
       "confidence": 0.85,
-      "component": "ServiceName",
-      "message": "Brief error description",
-      "reasoning": "Why this error occurred",
-      "stack_trace_depth": 10,
-      "possible_root_causes": ["Cause 1", "Cause 2"],
-      "recommended_actions": ["Action 1", "Action 2"]
+      "component": "ComponentName",
+      "message": "Brief description",
+      "reasoning": "Why this is an error",
+      "stack_trace_depth": 0,
+      "possible_root_causes": ["Cause 1"],
+      "recommended_actions": ["Fix 1"]
     }}
   ]
 }}
 
-Output ONLY valid JSON."""
+Output valid JSON with ALL errors."""
 
-        result = self.safe_llm_call(prompt, "You are an error analyst. Output ONLY valid JSON.")
+            result = self.safe_llm_call(prompt, "Analyze errors. Output ONLY valid JSON.")
 
-        if result and isinstance(result, dict) and 'events' in result:
-            events = result['events']
-        elif result and isinstance(result, list):
-            events = result
-        else:
-            events = []
-
-        events = self._enrich_events_with_context(events, indices, state)
-        return events
+            if result and isinstance(result, dict) and 'events' in result:
+                events = result['events']
+            elif result and isinstance(result, list):
+                events = result
+            else:
+                # FALLBACK: Create basic events
+                console.print(f"[yellow]  ⚠ LLM returned empty, creating basic events from {len(batch)} logs...[/yellow]")
+                events = []
+                skipped_success = 0
+                for log in batch:
+                    # Try to extract component from [brackets] but NOT timestamps
+                    component_match = re.search(r'\[([^\]]+)\]', log)
+                    if component_match:
+                        comp = component_match.group(1)
+                        # Skip if it looks like a timestamp (contains date/time patterns)
+                        if re.match(r'\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}', comp) or re.match(r'\w{3}\s+\w{3}\s+\d{2}', comp):
+                            component = "ApacheServer"  # Default for Apache logs
+                        else:
+                            component = comp
+                    else:
+                        component = "System"
+                    
+                    # Skip HTTP success codes (200, 201, 204, 301, 302, 304)
+                    if any(code in log for code in ['" 200 ', '" 201 ', '" 204 ', '" 301 ', '" 302 ', '" 304 ']):
+                        skipped_success += 1
+                        continue  # Skip this log - it's not an error
+                    
+                    # Check for HTTP error codes (access log format with quotes)
+                    if '" 404 ' in log or ' 404 ' in log:
+                        exception = "HTTP404NotFound"
+                        severity = "MEDIUM"
+                        confidence = 0.8
+                    elif any(code in log for code in ['" 500 ', '" 502 ', '" 503 ', '" 504 ']):
+                        exception = "HTTPServerError"
+                        severity = "HIGH"
+                        confidence = 0.85
+                    elif any(code in log for code in [' 500 ', ' 502 ', ' 503 ']):
+                        exception = "HTTPServerError"
+                        severity = "HIGH"
+                        confidence = 0.85
+                    elif 'authentication failure' in log.lower() or 'user unknown' in log.lower():
+                        exception = "AuthenticationFailure"
+                        severity = "HIGH"
+                        confidence = 0.9
+                    elif 'error' in log.lower():
+                        exception = "GenericError"
+                        severity = "MEDIUM"
+                        confidence = 0.7
+                    else:
+                        exception = "UnknownIssue"
+                        severity = "LOW"
+                        confidence = 0.6
+                    
+                    events.append({
+                        "exception_class": exception,
+                        "severity": severity,
+                        "confidence": confidence,
+                        "component": component,
+                        "message": log[:150],
+                        "reasoning": "Error detected in logs",
+                        "stack_trace_depth": 0,
+                        "possible_root_causes": ["Check logs for details"],
+                        "recommended_actions": ["Investigate this error"]
+                    })
+            
+            # Debug: Show what fallback created
+            if 'skipped_success' in locals():
+                console.print(f"[dim]  Fallback: created {len(events)} events, skipped {skipped_success} success codes[/dim]")
+            
+            enriched = self._enrich_events_with_context(events, batch_indices, state)
+            all_events.extend(enriched)
+        
+        return all_events
 
     # ========================================================================
     # QUICK ANALYSIS
@@ -1099,6 +1247,9 @@ Return JSON: {{"events": [...]}}"""
 
         if self.dashboard:
             self.dashboard.update(current_stage="Specialized Analysis")
+
+        # Debug: Show categorization
+        console.print(f"[dim]→ Categories: DB={len(state['db_errors'])} | NULL={len(state['null_errors'])} | NET={len(state['network_errors'])} | AUTH={len(state['auth_errors'])} | GEN={len(state['generic_errors'])}[/dim]")
 
         all_events = []
 
@@ -1175,6 +1326,7 @@ Return JSON: {{"events": [...]}}"""
     def agent_confidence_filter(self, state: AnalysisState) -> AnalysisState:
         """Separate high-confidence from low-confidence events"""
         console.print("\n[bold magenta]📊 Confidence Filtering[/bold magenta]")
+        console.print(f"[dim]→ Filtering {len(state['error_events'])} events with threshold 0.4...[/dim]")
 
         if self.dashboard:
             self.dashboard.update(current_stage="Confidence Filtering")
@@ -1184,7 +1336,7 @@ Return JSON: {{"events": [...]}}"""
 
         for event in state['error_events']:
             confidence = event.get('confidence', 0.5)
-            if confidence >= 0.7:
+            if confidence >= 0.4:  # Lowered from 0.7 for multi-format support
                 high_confidence.append(event)
             else:
                 low_confidence.append(event)
