@@ -3,5 +3,7 @@ pandas
 plotly
 langgraph
 langchain
+langchain-groq
 openai
 numpy
+tiktoken
