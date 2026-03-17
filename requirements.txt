@@ -4,3 +4,4 @@ plotly
 langgraph
 langchain
 openai
+numpy
